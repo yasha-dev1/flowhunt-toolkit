@@ -117,6 +117,18 @@ def evaluate(ctx, csv_file, flow_id, judge_flow_id, output_dir, batch_size):
         except Exception as e:
             click.echo(f"Warning: Failed to save results: {str(e)}", err=True)
         
+        # Generate HTML report with visualizations
+        try:
+            click.echo("\nGenerating interactive HTML report...")
+            report_path = evaluator.generate_html_report(results, output_path, flow_id)
+            click.echo(f"HTML report saved to {report_path}")
+            click.echo("\n🎉 Evaluation complete! Open the HTML report to view interactive visualizations.")
+        except Exception as e:
+            click.echo(f"Warning: Failed to generate HTML report: {str(e)}", err=True)
+            if verbose:
+                import traceback
+                click.echo(f"Traceback: {traceback.format_exc()}", err=True)
+        
     except KeyboardInterrupt:
         click.echo("\nEvaluation interrupted by user.", err=True)
         sys.exit(1)

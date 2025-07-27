@@ -6,6 +6,7 @@ from pathlib import Path
 import json
 
 from .client import FlowHuntClient
+from .report_generator import EvaluationReportGenerator
 
 
 class FlowEvaluator:
@@ -23,6 +24,7 @@ class FlowEvaluator:
         """
         self.client = client
         self.judge_flow_id = judge_flow_id or self.DEFAULT_JUDGE_FLOW_ID
+        self.report_generator = EvaluationReportGenerator()
     
     def load_evaluation_data(self, csv_file: Path) -> pd.DataFrame:
         """Load evaluation data from CSV file.
@@ -69,16 +71,23 @@ class FlowEvaluator:
 
                 # Use LLM judge to evaluate the answer
                 judge_result = self._judge_answer(expected_answer, actual_answer)
+
+                # judge_result should have score, correctness and reasoning at least
+                judge_score = judge_result.pop('total_rating', 0)
+                judge_correctness = judge_result.pop('correctness', 'Unknown')
+                judge_reasoning = judge_result.pop('reasoning', 'No reasoning provided')
+
                 
                 result = {
                     "question": question,
                     "expected_answer": expected_answer,
                     "actual_answer": actual_answer,
-                    "judge_score": judge_result.get("total_rating", 0),
-                    "judge_reasoning": judge_result.get("reasoning", "No reasoning provided"),
-                    "judge_correctness": judge_result.get("correctness", "Unknown"),
                     "flow_id": flow_id,
                     "judge_flow_id": self.judge_flow_id,
+                    "judge_score": judge_score,
+                    "judge_correctness": judge_correctness,
+                    "judge_reasoning": judge_reasoning,
+                    **judge_result,  # Include judge results
                 }
                 
             except Exception as e:
@@ -88,8 +97,8 @@ class FlowEvaluator:
                     "expected_answer": expected_answer,
                     "actual_answer": f"ERROR: {str(e)}",
                     "judge_score": 0,
-                    "judge_reasoning": f"Failed to execute flow: {str(e)}",
                     "judge_correctness": "Error",
+                    "judge_reasoning": f"Error during evaluation: {str(e)}",
                     "flow_id": flow_id,
                     "judge_flow_id": self.judge_flow_id,
                     "error": str(e)
@@ -132,11 +141,16 @@ class FlowEvaluator:
     def calculate_summary_stats(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Calculate comprehensive summary statistics from evaluation results.
         
+        Analyzes all columns in the results, providing:
+        - Basic statistics for numerical columns (mean, median, std, quartiles, etc.)
+        - Value counts and distributions for categorical columns
+        - Legacy compatibility with existing statistics
+        
         Args:
             results: List of evaluation results
             
         Returns:
-            Summary statistics including accuracy, score distribution, and error rates
+            Dictionary with overall_stats (legacy compatibility) and column_stats (detailed analysis)
         """
         if not results:
             return {
@@ -147,43 +161,73 @@ class FlowEvaluator:
                 "pass_rate": 0.0,
                 "accuracy": 0.0,
                 "error_rate": 0.0,
+                "column_stats": {},
+                "overall_stats": {}
             }
         
-        # Convert results to DataFrame for easier analysis
+        # Convert results to DataFrame for comprehensive analysis
         df = pd.DataFrame(results)
         
-        # Extract numeric scores, handling errors and non-numeric values
-        scores = []
-        errors = 0
-        correct_answers = 0
+        # Fixed columns that should not be analyzed as dynamic columns
+        fixed_columns = {'question', 'expected_answer', 'actual_answer', 'flow_id', 'judge_flow_id'}
         
-        for result in results:
-            score = result.get('judge_score', 0)
-            correctness = result.get('judge_correctness', 'Unknown')
-            if isinstance(score, (int, float)):
-                scores.append(float(score))
-            else:
-                scores.append(0.0)
-
-            if correctness.lower() == 'correct':
-                correct_answers += 1
+        # Calculate legacy statistics for backward compatibility
+        legacy_stats = self._calculate_legacy_stats(df)
+        
+        # Analyze all columns dynamically
+        column_stats = {}
+        for column in df.columns:
+            if column not in fixed_columns:
+                column_stats[column] = self._analyze_column(df[column], column)
+        
+        # Combine results with legacy compatibility
+        result = {
+            **legacy_stats,  # Legacy stats at top level for backward compatibility
+            "column_stats": column_stats,
+            "overall_stats": legacy_stats
+        }
+        
+        return result
+    
+    def _calculate_legacy_stats(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """Calculate legacy statistics for backward compatibility.
+        
+        Args:
+            df: DataFrame with evaluation results
             
-            if correctness.lower() == 'incorrect':
-                errors += 1
+        Returns:
+            Dictionary with legacy statistics
+        """
+        total_questions = len(df)
         
-        scores_series = pd.Series(scores)
+        # Handle judge_score with proper error handling
+        if 'judge_score' in df.columns:
+            # Convert to numeric, coercing errors to NaN
+            scores = pd.to_numeric(df['judge_score'], errors='coerce').fillna(0.0)
+            average_score = scores.mean()
+            median_score = scores.median()
+            std_score = scores.std()
+            min_score = scores.min()
+            max_score = scores.max()
+            q25_score = scores.quantile(0.25)
+            q75_score = scores.quantile(0.75)
+        else:
+            average_score = median_score = std_score = 0.0
+            min_score = max_score = q25_score = q75_score = 0.0
         
-        # Calculate basic statistics
-        total_questions = len(results)
-        average_score = scores_series.mean()
-        median_score = scores_series.median()
-        std_score = scores_series.std()
+        # Handle judge_correctness
+        if 'judge_correctness' in df.columns:
+            correctness_counts = df['judge_correctness'].str.lower().value_counts()
+            correct_answers = correctness_counts.get('correct', 0)
+            incorrect_answers = correctness_counts.get('incorrect', 0)
+        else:
+            correct_answers = incorrect_answers = 0
         
         # Calculate rates
         pass_rate = (correct_answers / total_questions) * 100 if total_questions > 0 else 0
         accuracy = pass_rate  # Same as pass rate in this context
-        error_rate = (errors / total_questions) * 100 if total_questions > 0 else 0
-
+        error_rate = (incorrect_answers / total_questions) * 100 if total_questions > 0 else 0
+        
         return {
             "total_questions": total_questions,
             "average_score": average_score,
@@ -192,8 +236,95 @@ class FlowEvaluator:
             "pass_rate": pass_rate,
             "accuracy": accuracy,
             "error_rate": error_rate,
-            "min_score": scores_series.min(),
-            "max_score": scores_series.max(),
-            "q25_score": scores_series.quantile(0.25),
-            "q75_score": scores_series.quantile(0.75)
+            "min_score": min_score,
+            "max_score": max_score,
+            "q25_score": q25_score,
+            "q75_score": q75_score
         }
+    
+    def _analyze_column(self, series: pd.Series, column_name: str) -> Dict[str, Any]:
+        """Analyze a single column and return appropriate statistics.
+        
+        Args:
+            series: Pandas Series to analyze
+            column_name: Name of the column
+            
+        Returns:
+            Dictionary with column analysis including type and statistics
+        """
+        # Remove null values for analysis
+        clean_series = series.dropna()
+        
+        if len(clean_series) == 0:
+            return {
+                "type": "empty",
+                "count": 0,
+                "null_count": len(series)
+            }
+        
+        # Try to convert to numeric
+        numeric_series = pd.to_numeric(clean_series, errors='coerce')
+        numeric_count = numeric_series.notna().sum()
+        numeric_percentage = (numeric_count / len(clean_series)) * 100
+        
+        # Determine if column is primarily numerical (>80% numeric values)
+        if numeric_percentage > 80 and numeric_count > 0:
+            # Numerical column analysis
+            numeric_clean = numeric_series.dropna()
+            return {
+                "type": "numerical",
+                "count": len(clean_series),
+                "null_count": len(series) - len(clean_series),
+                "numeric_count": numeric_count,
+                "mean": numeric_clean.mean(),
+                "median": numeric_clean.median(),
+                "std": numeric_clean.std(),
+                "min": numeric_clean.min(),
+                "max": numeric_clean.max(),
+                "q25": numeric_clean.quantile(0.25),
+                "q75": numeric_clean.quantile(0.75),
+                "visualization_type": "histogram"
+            }
+        else:
+            # Categorical column analysis
+            value_counts = clean_series.value_counts()
+            total_count = len(clean_series)
+            
+            # Limit to top 20 categories for performance
+            top_categories = value_counts.head(20)
+            
+            return {
+                "type": "categorical",
+                "count": total_count,
+                "null_count": len(series) - len(clean_series),
+                "unique_count": len(value_counts),
+                "top_categories": top_categories.to_dict(),
+                "top_categories_percentage": (top_categories / total_count * 100).round(2).to_dict(),
+                "most_common": value_counts.index[0] if len(value_counts) > 0 else None,
+                "most_common_count": value_counts.iloc[0] if len(value_counts) > 0 else 0,
+                "visualization_type": "bar_chart"
+            }
+    
+    def generate_html_report(self, results: List[Dict[str, Any]], output_dir: Path, 
+                           flow_id: str) -> Path:
+        """Generate interactive HTML report with visualizations.
+        
+        Args:
+            results: List of evaluation results
+            output_dir: Directory to save the report
+            flow_id: Flow ID for naming the report
+            
+        Returns:
+            Path to generated HTML report
+        """
+        # Calculate summary statistics
+        summary_stats = self.calculate_summary_stats(results)
+        
+        # Generate report filename
+        from datetime import datetime
+        date_str = datetime.now().strftime("%Y%m%d")
+        report_name = f"eval_report_{date_str}-{flow_id}.html"
+        report_path = output_dir / report_name
+        
+        # Generate HTML report
+        return self.report_generator.generate_html_report(results, report_path, summary_stats)
