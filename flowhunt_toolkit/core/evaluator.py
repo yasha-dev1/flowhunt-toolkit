@@ -319,6 +319,8 @@ class FlowEvaluator:
         """
         # Calculate summary statistics
         summary_stats = self.calculate_summary_stats(results)
+        summary_stats['accuracy'] = summary_stats['accuracy'] / 100
+        summary_stats['error_rate'] = summary_stats['error_rate'] / 100
         
         # Generate report filename
         from datetime import datetime
