@@ -1,0 +1,6 @@
+include README.md
+include LICENSE
+recursive-include flowhunt_toolkit *.py
+recursive-include tests *.py
+global-exclude *.pyc
+global-exclude __pycache__
