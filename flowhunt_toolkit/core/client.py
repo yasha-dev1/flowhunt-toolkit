@@ -151,7 +151,7 @@ class FlowHuntClient:
         process_id = self.invoke_flow(flow_id, variables, human_input)
         
         start_time = time.time()
-        check_interval = 5
+        check_interval = 3
         
         while time.time() - start_time < timeout:
             is_ready, result = self.get_flow_results(flow_id, process_id)
@@ -207,7 +207,8 @@ class FlowHuntClient:
                 raise Exception(f"Failed to list flows: {e}")
     
     def batch_execute_from_csv(self, csv_file: str, flow_id: str, output_dir: str, 
-                              overwrite: bool = False, check_interval: int = 10) -> Dict[str, int]:
+                              overwrite: bool = False, check_interval: int = 10, 
+                              max_parallel: int = 50) -> Dict[str, int]:
         """Execute a flow for each row in a CSV file.
         
         Args:
@@ -216,6 +217,7 @@ class FlowHuntClient:
             output_dir: Directory to save output files
             overwrite: Whether to overwrite existing files
             check_interval: Seconds between result checks
+            max_parallel: Maximum number of tasks to schedule in parallel
             
         Returns:
             Dictionary with execution statistics
@@ -226,18 +228,18 @@ class FlowHuntClient:
         if not topics:
             return {"completed": 0, "failed": 0, "skipped": 0, "total": 0}
         
-        # Filter existing files if not overwriting
+        # Filter existing files if not overwriting (only if we have filenames and output_dir)
         skipped_count = 0
-        if not overwrite:
+        if not overwrite and output_dir and any('filename' in topic for topic in topics):
             topics, skipped_count = self._filter_existing_files(topics, output_dir)
         
         if not topics:
             return {"completed": 0, "failed": 0, "skipped": skipped_count, "total": skipped_count}
         
         # Execute batch processing
-        return self._process_batch_topics(topics, flow_id, output_dir, check_interval, skipped_count)
+        return self._process_batch_topics(topics, flow_id, output_dir, check_interval, skipped_count, max_parallel)
     
-    def _read_csv_topics(self, csv_file: str) -> List[Dict[str, str]]:
+    def _read_csv_topics(self, csv_file: str) -> List[Dict[str, Any]]:
         """Read topics from CSV file."""
         topics = []
         
@@ -250,18 +252,30 @@ class FlowHuntClient:
             with open(csv_file, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f, delimiter=delimiter)
                 
-                if 'flow_input' not in reader.fieldnames or 'filename' not in reader.fieldnames:
-                    raise ValueError("CSV file must contain 'flow_input' and 'filename' columns")
+                if 'flow_input' not in reader.fieldnames:
+                    raise ValueError("CSV file must contain 'flow_input' column")
                 
                 for row in reader:
                     flow_input = row['flow_input'].strip()
-                    filename = row['filename'].strip()
                     
-                    if flow_input and filename:
-                        topics.append({
-                            'flow_input': flow_input,
-                            'filename': filename
-                        })
+                    if flow_input:
+                        topic = {
+                            'flow_input': flow_input
+                        }
+                        
+                        # Add filename if present
+                        if 'filename' in reader.fieldnames and row['filename']:
+                            topic['filename'] = row['filename'].strip()
+                        
+                        # Parse flow_variable as JSON if present
+                        if 'flow_variable' in reader.fieldnames and row['flow_variable']:
+                            try:
+                                import json
+                                topic['flow_variable'] = json.loads(row['flow_variable'].strip())
+                            except json.JSONDecodeError as e:
+                                raise ValueError(f"Invalid JSON in flow_variable column for row with flow_input '{flow_input}': {e}")
+                        
+                        topics.append(topic)
         
         except Exception as e:
             raise Exception(f"Error reading CSV file: {e}")
@@ -301,8 +315,9 @@ class FlowHuntClient:
         return filtered_topics, skipped_count
     
     def _process_batch_topics(self, topics: List[Dict[str, str]], flow_id: str, 
-                             output_dir: str, check_interval: int, skipped_count: int) -> Dict[str, int]:
-        """Process topics in batch."""
+                             output_dir: str, check_interval: int, skipped_count: int, 
+                             max_parallel: int = 50) -> Dict[str, int]:
+        """Process topics in batch with controlled parallelism."""
         workspace_id = self.get_workspace_id()
         
         with self.flowhunt.ApiClient(self.configuration) as api_client:
@@ -312,72 +327,79 @@ class FlowHuntClient:
             pending_tasks = {}
             completed_tasks = []
             failed_tasks = []
+            topics_queue = topics.copy()
             
-            # Schedule all tasks
-            print(f"Scheduling {len(topics)} tasks...")
-            progress_bar = tqdm(total=len(topics), desc="Scheduling")
+            print(f"Processing {len(topics)} tasks with max {max_parallel} parallel tasks...")
+            total_progress = tqdm(total=len(topics), desc="Total Progress")
             
-            for topic in topics:
-                try:
-                    flow_invoke_request = self.flowhunt.FlowInvokeRequest(
-                        variables={
-                            "today": time.strftime("%Y-%m-%d"),
-                            "v": "1",
-                            "filename": topic['filename'],
-                        },
-                        human_input=topic['flow_input']
-                    )
-                    
-                    response = api_instance.invoke_flow_singleton(
-                        flow_id=flow_id,
-                        workspace_id=workspace_id,
-                        flow_invoke_request=flow_invoke_request
-                    )
-                    
-                    pending_tasks[response.id] = topic
-                    
-                except Exception as e:
-                    print(f"Failed to schedule task for '{topic['flow_input']}': {e}")
-                    failed_tasks.append(topic)
-                
-                progress_bar.update(1)
-            
-            progress_bar.close()
-            
-            # Process results
-            print(f"Processing {len(pending_tasks)} tasks...")
-            progress_bar = tqdm(total=len(pending_tasks), desc="Processing")
-            
-            while pending_tasks:
-                time.sleep(check_interval)
-                process_ids = list(pending_tasks.keys())
-                completed_in_batch = 0
-                
-                for process_id in process_ids:
-                    topic_data = pending_tasks[process_id]
+            while topics_queue or pending_tasks:
+                # Schedule new tasks up to max_parallel limit
+                while len(pending_tasks) < max_parallel and topics_queue:
+                    topic = topics_queue.pop(0)
                     
                     try:
-                        is_ready, content = self.get_flow_results(flow_id, process_id)
+                        # Build variables dictionary
+                        variables = {}
                         
-                        if is_ready:
-                            del pending_tasks[process_id]
-                            completed_in_batch += 1
-                            
-                            if content and content != "NOCONTENT":
-                                self._save_content(content, topic_data['filename'], output_dir)
-                                completed_tasks.append(topic_data)
-                            else:
-                                failed_tasks.append(topic_data)
-                                
+                        # Add filename if present
+                        if 'filename' in topic:
+                            variables["filename"] = topic['filename']
+                        
+                        # Merge flow_variable JSON if present
+                        if 'flow_variable' in topic and isinstance(topic['flow_variable'], dict):
+                            variables.update(topic['flow_variable'])
+                        
+                        flow_invoke_request = self.flowhunt.FlowInvokeRequest(
+                            variables=variables,
+                            human_input=topic['flow_input']
+                        )
+                        
+                        response = api_instance.invoke_flow_singleton(
+                            flow_id=flow_id,
+                            workspace_id=workspace_id,
+                            flow_invoke_request=flow_invoke_request
+                        )
+                        
+                        pending_tasks[response.id] = topic
+                        
                     except Exception as e:
-                        print(f"Error processing task {process_id}: {e}")
-                        del pending_tasks[process_id]
-                        failed_tasks.append(topic_data)
-                        completed_in_batch += 1
+                        print(f"Failed to schedule task for '{topic['flow_input']}': {e}")
+                        failed_tasks.append(topic)
+                        total_progress.update(1)
                 
-                progress_bar.update(completed_in_batch)
+                # Check for completed tasks
+                if pending_tasks:
+                    time.sleep(check_interval)
+                    process_ids = list(pending_tasks.keys())
+                    completed_in_batch = 0
+                    
+                    for process_id in process_ids:
+                        topic_data = pending_tasks[process_id]
+                        
+                        try:
+                            is_ready, content = self.get_flow_results(flow_id, process_id)
+                            
+                            if is_ready:
+                                del pending_tasks[process_id]
+                                completed_in_batch += 1
+                                
+                                if content and content != "NOCONTENT":
+                                    # Only save to file if filename is provided and output_dir exists
+                                    if 'filename' in topic_data and output_dir:
+                                        self._save_content(content, topic_data['filename'], output_dir)
+                                    completed_tasks.append(topic_data)
+                                else:
+                                    failed_tasks.append(topic_data)
+                                    
+                        except Exception as e:
+                            print(f"Error processing task {process_id}: {e}")
+                            del pending_tasks[process_id]
+                            failed_tasks.append(topic_data)
+                            completed_in_batch += 1
+                    
+                    total_progress.update(completed_in_batch)
             
-            progress_bar.close()
+            total_progress.close()
         
         return {
             "completed": len(completed_tasks),

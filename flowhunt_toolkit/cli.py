@@ -257,21 +257,33 @@ def inspect(ctx, flow_id, output_format):
 @click.argument('flow_id', type=str)
 @click.option('--output-dir', '-o', type=click.Path(), help='Output directory for generated files (for CSV with flow_input/filename columns)')
 @click.option('--output-file', type=click.Path(), help='Output file for results (for JSON or other formats)')
+@click.option("--format", type=click.Choice(['json', 'csv']), default='csv', help='Output format for results (default: csv)')
 @click.option('--overwrite', is_flag=True, help='Overwrite existing files')
 @click.option('--check-interval', type=int, default=10, help='Seconds between result checks (default: 10)')
+@click.option('--max-parallel', type=int, default=50, help='Maximum number of tasks to schedule in parallel (default: 50)')
 @click.pass_context
-def batch_run(ctx, input_file, flow_id, output_dir, output_file, overwrite, check_interval):
+def batch_run(ctx, input_file, flow_id, output_dir, output_file, format, overwrite, check_interval, max_parallel):
     """Run a flow in batch mode with multiple inputs.
     
-    For CSV files with 'flow_input' and 'filename' columns, this will use the
-    optimized batch execution method that handles large-scale processing.
+    Supported input formats:
+    - CSV: Columns supported: flow_input (mandatory), filename (optional), flow_variable (optional JSON)
+    - JSON: Array of objects or single object with flow data
+    - TXT: Each line becomes a flow_input
     
-    For other formats, it will process inputs sequentially.
+    When CSV 'filename' column is present, --output-dir must be specified.
     
-    INPUT_FILE: Path to file containing input data (CSV or JSON)
+    If no --output-file is specified, results are automatically saved as:
+    {current-date}-{flow-id}-output.{format} in the current directory.
+    
+    INPUT_FILE: Path to file containing input data (CSV, JSON, or TXT)
     FLOW_ID: The FlowHunt flow ID to execute
     """
     verbose = ctx.obj.get('verbose', False)
+    
+    # Validate that output_dir and output_file are not both specified
+    if output_dir and output_file:
+        click.echo("Error: --output-dir and --output-file cannot be used together. Choose one.", err=True)
+        sys.exit(1)
     
     if verbose:
         click.echo(f"Running batch execution for flow {flow_id}")
@@ -280,7 +292,7 @@ def batch_run(ctx, input_file, flow_id, output_dir, output_file, overwrite, chec
             click.echo(f"Output directory: {output_dir}")
         if output_file:
             click.echo(f"Output file: {output_file}")
-    
+
     try:
         # Initialize FlowHunt client
         try:
@@ -297,26 +309,63 @@ def batch_run(ctx, input_file, flow_id, output_dir, output_file, overwrite, chec
         # Check if this is a CSV file with the expected format for batch processing
         if input_path.suffix.lower() == '.csv':
             try:
-                # Try to detect if it has the expected columns for batch processing
+                # Validate CSV format and columns
                 import csv
                 with open(input_path, 'r', encoding='utf-8') as f:
                     reader = csv.DictReader(f)
-                    fieldnames = reader.fieldnames or []
+                    fieldnames = reader.fieldnames
                     
-                if 'flow_input' in fieldnames and 'filename' in fieldnames:
-                    # Use optimized batch processing
-                    if not output_dir:
-                        click.echo("Error: --output-dir is required for CSV files with 'flow_input' and 'filename' columns.", err=True)
+                    # Check if CSV has headers
+                    if not fieldnames:
+                        click.echo("Error: CSV file must have headers.", err=True)
                         sys.exit(1)
                     
-                    click.echo("Using optimized batch processing for CSV with flow_input/filename columns...")
+                    # Define allowed columns
+                    mandatory_columns = {'flow_input'}
+                    optional_columns = {'filename', 'flow_variable'}
+                    allowed_columns = mandatory_columns | optional_columns
+                    
+                    # Check for mandatory columns
+                    missing_mandatory = mandatory_columns - set(fieldnames)
+                    if missing_mandatory:
+                        click.echo(f"Error: CSV file must contain the following mandatory column(s): {', '.join(missing_mandatory)}", err=True)
+                        sys.exit(1)
+                    
+                    # Check for invalid columns
+                    invalid_columns = set(fieldnames) - allowed_columns
+                    if invalid_columns:
+                        click.echo(f"Error: CSV file contains invalid column(s): {', '.join(invalid_columns)}", err=True)
+                        click.echo(f"Allowed columns are: {', '.join(sorted(allowed_columns))}", err=True)
+                        sys.exit(1)
+                    
+                    # Check if filename column exists and output_dir is required
+                    has_filename = 'filename' in fieldnames
+                    has_flow_variable = 'flow_variable' in fieldnames
+                    
+                    if has_filename and not output_dir:
+                        click.echo("Error: --output-dir is required when CSV file contains 'filename' column.", err=True)
+                        sys.exit(1)
+                    
+                    # Check if output_dir is specified without filename column
+                    if not has_filename and output_dir:
+                        click.echo("Error: --output-dir only makes sense when CSV file contains 'filename' column.", err=True)
+                        sys.exit(1)
+                
+                # If we reach here, CSV validation passed
+                # Use optimized batch processing if we have filename or flow_variable columns
+                if has_filename or has_flow_variable:
+                    if has_filename:
+                        click.echo("Using optimized batch processing for CSV with flow_input/filename columns...")
+                    else:
+                        click.echo("Using optimized batch processing for CSV with flow_input/flow_variable columns...")
                     
                     stats = client.batch_execute_from_csv(
                         csv_file=str(input_path),
                         flow_id=flow_id,
                         output_dir=output_dir,
                         overwrite=overwrite,
-                        check_interval=check_interval
+                        check_interval=check_interval,
+                        max_parallel=max_parallel
                     )
                     
                     click.echo(f"\nBatch execution completed!")
@@ -326,13 +375,20 @@ def batch_run(ctx, input_file, flow_id, output_dir, output_file, overwrite, chec
                     click.echo(f"Skipped (files already exist): {stats['skipped']}")
                     
                     return
+                else:
+                    # CSV has only flow_input - fall through to standard processing
+                    click.echo("Processing CSV with flow_input column using standard method...")
                     
             except Exception as e:
+                if "CSV file must have headers" in str(e) or "CSV file must contain" in str(e) or "CSV file contains invalid" in str(e) or "--output-dir is required" in str(e):
+                    # Re-raise validation errors
+                    raise
                 if verbose:
                     click.echo(f"Could not use optimized batch processing: {e}")
                 click.echo("Falling back to standard processing...")
         
         # Standard processing for other formats or CSV without expected columns
+        inputs_list = []
         try:
             if input_path.suffix.lower() == '.csv':
                 import pandas as pd
@@ -346,8 +402,13 @@ def batch_run(ctx, input_file, flow_id, output_dir, output_file, overwrite, chec
                         inputs_list = file_content
                     else:
                         inputs_list = [file_content]
+            elif input_path.suffix.lower() == '.txt':
+                # TXT file support - each line is a flow_input
+                with open(input_path, 'r', encoding='utf-8') as f:
+                    lines = [line.strip() for line in f.readlines() if line.strip()]
+                    inputs_list = [{'flow_input': line} for line in lines]
             else:
-                click.echo(f"Error: Unsupported file format. Use .csv or .json files.", err=True)
+                click.echo(f"Error: Unsupported file format. Use .csv, .json, or .txt files.", err=True)
                 sys.exit(1)
                 
             click.echo(f"Loaded {len(inputs_list)} inputs from {input_file}")
@@ -355,6 +416,13 @@ def batch_run(ctx, input_file, flow_id, output_dir, output_file, overwrite, chec
         except Exception as e:
             click.echo(f"Error: Failed to load input file: {str(e)}", err=True)
             sys.exit(1)
+        
+        # Generate automatic output file if not specified
+        if not output_file:
+            from datetime import datetime
+            current_date = datetime.now().strftime("%Y-%m-%d")
+            output_file = f"{current_date}-{flow_id}-output.{format}"
+            click.echo(f"No output file specified. Results will be saved to: {output_file}")
         
         # Execute flows sequentially
         results = []
@@ -365,9 +433,13 @@ def batch_run(ctx, input_file, flow_id, output_dir, output_file, overwrite, chec
                 try:
                     # Convert inputs to variables and human_input format
                     if isinstance(inputs, dict):
-                        # Use 'human_input' key if present, otherwise use all as variables
-                        human_input = inputs.pop('human_input', '')
-                        variables = inputs
+                        # Use 'flow_input' key if present, otherwise use 'human_input' key, otherwise use all as variables
+                        if 'flow_input' in inputs:
+                            human_input = inputs.pop('flow_input', '')
+                            variables = inputs
+                        else:
+                            human_input = inputs.pop('human_input', '')
+                            variables = inputs
                     else:
                         human_input = str(inputs)
                         variables = {}
@@ -375,14 +447,16 @@ def batch_run(ctx, input_file, flow_id, output_dir, output_file, overwrite, chec
                     result = client.execute_flow(flow_id, variables=variables, human_input=human_input)
                     results.append({
                         'input_index': i,
-                        'inputs': inputs,
+                        'flow_input': human_input,
+                        'variables': variables,
                         'result': result,
                         'status': 'success'
                     })
                 except Exception as e:
                     results.append({
                         'input_index': i,
-                        'inputs': inputs,
+                        'flow_input': human_input if 'human_input' in locals() else str(inputs),
+                        'variables': variables if 'variables' in locals() else {},
                         'result': None,
                         'status': 'error',
                         'error': str(e)
@@ -397,24 +471,26 @@ def batch_run(ctx, input_file, flow_id, output_dir, output_file, overwrite, chec
         click.echo(f"Successful: {successful}")
         click.echo(f"Failed: {failed}")
         
-        # Save results if output file specified
+        # Save results if output file specified or auto-generated
         if output_file:
             try:
                 output_path = Path(output_file)
-                if output_path.suffix.lower() == '.json':
-                    import json
-                    with open(output_path, 'w') as f:
-                        json.dump(results, f, indent=2)
-                elif output_path.suffix.lower() == '.csv':
+                
+                if format == 'csv' or output_path.suffix.lower() == '.csv':
                     import pandas as pd
                     # Flatten results for CSV
                     flattened = []
                     for r in results:
-                        row = {'input_index': r['input_index'], 'status': r['status']}
-                        if isinstance(r['inputs'], dict):
-                            row.update(r['inputs'])
-                        else:
-                            row['input'] = str(r['inputs'])
+                        row = {
+                            'input_index': r['input_index'],
+                            'flow_input': r['flow_input'],
+                            'status': r['status']
+                        }
+                        # Add variables as separate columns
+                        if r['variables']:
+                            for key, value in r['variables'].items():
+                                row[f'var_{key}'] = str(value)
+                        
                         if r['status'] == 'success':
                             row['result'] = str(r['result'])
                         else:
@@ -424,7 +500,7 @@ def batch_run(ctx, input_file, flow_id, output_dir, output_file, overwrite, chec
                     df = pd.DataFrame(flattened)
                     df.to_csv(output_path, index=False)
                 else:
-                    # Default to JSON
+                    # JSON format
                     import json
                     with open(output_path, 'w') as f:
                         json.dump(results, f, indent=2)
@@ -432,7 +508,7 @@ def batch_run(ctx, input_file, flow_id, output_dir, output_file, overwrite, chec
                 click.echo(f"Results saved to {output_file}")
             except Exception as e:
                 click.echo(f"Warning: Failed to save results: {str(e)}", err=True)
-        
+
     except KeyboardInterrupt:
         click.echo("\nBatch execution interrupted by user.", err=True)
         sys.exit(1)
