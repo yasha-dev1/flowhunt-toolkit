@@ -32,26 +32,33 @@ def main(ctx, verbose):
 @click.argument('csv_file', type=click.Path(exists=True))
 @click.argument('flow_id', type=str)
 @click.option('--judge-flow-id', type=str, help='Custom LLM judge flow ID (uses default public flow if not specified)')
-@click.option('--output', '-o', type=click.Path(), help='Output file for evaluation results')
+@click.option('--output-dir', '-o', type=click.Path(), help='Output Directory for evaluation results (default: eval_output)')
 @click.option('--batch-size', type=int, default=10, help='Batch size for processing (default: 10)')
 @click.pass_context
-def evaluate(ctx, csv_file, flow_id, judge_flow_id, output, batch_size):
+def evaluate(ctx, csv_file, flow_id, judge_flow_id, output_dir, batch_size):
     """Evaluate a flow using LLM as a judge.
     
-    This command takes a CSV file with 'question' and 'expected_answer' columns
+    This command takes a CSV file with 'flow_input' and 'expected_output' columns
     and evaluates the specified flow's performance using an LLM judge.
     
-    CSV_FILE: Path to CSV file with question and expected_answer columns
+    CSV_FILE: Path to CSV file with flow_input and expected_output columns
     FLOW_ID: The FlowHunt flow ID to evaluate
     """
     verbose = ctx.obj.get('verbose', False)
+    
+    # Set default output directory if not specified
+    if not output_dir:
+        output_dir = "eval_output"
+    
+    # Create output directory if it doesn't exist
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
     
     if verbose:
         click.echo(f"Evaluating flow {flow_id} with CSV: {csv_file}")
         click.echo(f"Judge flow ID: {judge_flow_id or 'default public flow'}")
         click.echo(f"Batch size: {batch_size}")
-        if output:
-            click.echo(f"Output file: {output}")
+        click.echo(f"Output Directory: {output_path.absolute()}")
     
     try:
         # Initialize FlowHunt client
@@ -81,7 +88,7 @@ def evaluate(ctx, csv_file, flow_id, judge_flow_id, output, batch_size):
             results = []
             for i in range(0, len(evaluation_data), batch_size):
                 batch = evaluation_data.iloc[i:i+batch_size]
-                batch_results = evaluator._evaluate_batch(flow_id, batch)
+                batch_results = evaluator.evaluate_batch(flow_id, batch)
                 results.extend(batch_results)
                 bar.update(len(batch))
         
@@ -90,23 +97,25 @@ def evaluate(ctx, csv_file, flow_id, judge_flow_id, output, batch_size):
         
         # Display results
         click.echo("\nEvaluation completed!")
-        click.echo(f"Total questions: {summary.get('total_questions', len(results))}")
+        click.echo(f"Total questions: {summary['total_questions']}")
+        click.echo(f"Average score: {summary['average_score']:.2f}/10")
+        click.echo(f"Median score: {summary['median_score']:.2f}/10")
+        click.echo(f"Standard deviation: {summary['std_score']:.2f}")
+        click.echo(f"Pass rate (≥7): {summary['pass_rate']:.1f}%")
+        click.echo(f"Accuracy: {summary['accuracy']:.1f}%")
+        click.echo(f"Error rate: {summary['error_rate']:.1f}%")
         
-        # Calculate actual summary stats
-        scores = [r.get('judge_score', 0) for r in results if isinstance(r.get('judge_score'), (int, float))]
-        if scores:
-            avg_score = sum(scores) / len(scores)
-            click.echo(f"Average score: {avg_score:.2f}/10")
-            pass_rate = len([s for s in scores if s >= 7]) / len(scores) * 100
-            click.echo(f"Pass rate (≥7): {pass_rate:.1f}%")
+        # Save results as CSV with proper naming
+        from datetime import datetime
+        current_date = datetime.now().strftime("%Y%m%d")
+        csv_filename = f"eval_results_{current_date}-{flow_id}.csv"
+        csv_path = output_path / csv_filename
         
-        # Save results if output file specified
-        if output:
-            try:
-                evaluator.save_results(results, Path(output))
-                click.echo(f"Results saved to {output}")
-            except Exception as e:
-                click.echo(f"Warning: Failed to save results: {str(e)}", err=True)
+        try:
+            evaluator.save_results(results, csv_path)
+            click.echo(f"\nResults saved to {csv_path}")
+        except Exception as e:
+            click.echo(f"Warning: Failed to save results: {str(e)}", err=True)
         
     except KeyboardInterrupt:
         click.echo("\nEvaluation interrupted by user.", err=True)

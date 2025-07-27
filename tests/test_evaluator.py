@@ -25,8 +25,8 @@ def evaluator(mock_client):
 def sample_csv_data():
     """Create sample CSV data for testing."""
     return pd.DataFrame({
-        'question': ['What is 2+2?', 'What is the capital of France?'],
-        'expected_answer': ['4', 'Paris']
+        'flow_input': ['What is 2+2?', 'What is the capital of France?'],
+        'expected_output': ['4', 'Paris']
     })
 
 
@@ -44,13 +44,13 @@ def test_evaluator_initialization(mock_client):
 def test_load_evaluation_data_valid_csv(evaluator, tmp_path):
     """Test loading valid CSV data."""
     csv_file = tmp_path / "test.csv"
-    csv_file.write_text("question,expected_answer\nWhat is 2+2?,4\nWhat is 3+3?,6\n")
+    csv_file.write_text("flow_input,expected_output\nWhat is 2+2?,4\nWhat is 3+3?,6\n")
     
     df = evaluator.load_evaluation_data(csv_file)
     assert len(df) == 2
-    assert list(df.columns) == ['question', 'expected_answer']
-    assert df.iloc[0]['question'] == 'What is 2+2?'
-    assert str(df.iloc[0]['expected_answer']) == '4'
+    assert list(df.columns) == ['flow_input', 'expected_output']
+    assert df.iloc[0]['flow_input'] == 'What is 2+2?'
+    assert str(df.iloc[0]['expected_output']) == '4'
 
 
 def test_load_evaluation_data_missing_columns(evaluator, tmp_path):
@@ -62,32 +62,42 @@ def test_load_evaluation_data_missing_columns(evaluator, tmp_path):
         evaluator.load_evaluation_data(csv_file)
 
 
-def test_create_judge_prompt(evaluator):
-    """Test judge prompt creation."""
-    question = "What is 2+2?"
+def test_judge_answer(evaluator):
+    """Test judge answer functionality."""
     expected = "4"
     actual = "The answer is 4"
     
-    prompt = evaluator._create_judge_prompt(question, expected, actual)
+    # Mock the client's execute_flow method
+    evaluator.client.execute_flow.return_value = '{"total_rating": 8, "reasoning": "Good answer", "correctness": "Correct"}'
     
-    assert question in prompt
-    assert expected in prompt
-    assert actual in prompt
-    assert "score" in prompt.lower()
-    assert "reasoning" in prompt.lower()
+    result = evaluator._judge_answer(expected, actual)
+    
+    assert result["total_rating"] == 8
+    assert result["reasoning"] == "Good answer"
+    assert result["correctness"] == "Correct"
 
 
 def test_evaluate_batch_structure(evaluator, sample_csv_data):
     """Test that evaluate_batch returns correct structure."""
     flow_id = "test-flow-id"
     
-    results = evaluator._evaluate_batch(flow_id, sample_csv_data)
+    # Mock the client methods
+    evaluator.client.execute_flow.side_effect = [
+        "The answer is 4",  # First flow execution
+        '{"total_rating": 8, "reasoning": "Good answer", "correctness": "Correct"}',  # First judge
+        "Paris is the capital",  # Second flow execution
+        '{"total_rating": 9, "reasoning": "Perfect answer", "correctness": "Correct"}'  # Second judge
+    ]
+    
+    results = evaluator.evaluate_batch(flow_id, sample_csv_data)
     
     assert len(results) == 2
     for result in results:
         assert 'question' in result
         assert 'expected_answer' in result
         assert 'actual_answer' in result
+        assert 'judge_score' in result
+        assert 'flow_id' in result
         assert 'judge_score' in result
         assert 'judge_reasoning' in result
         assert 'flow_id' in result
