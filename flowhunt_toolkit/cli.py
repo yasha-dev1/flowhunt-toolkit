@@ -5,10 +5,15 @@ import click
 import sys
 from typing import Optional
 from pathlib import Path
+import time
+from datetime import datetime
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
+from rich.console import Console
 
 from . import __version__
 from .core.client import FlowHuntClient
 from .core.evaluator import FlowEvaluator
+from .utils.logger import Logger
 
 
 @click.group()
@@ -280,10 +285,11 @@ def inspect(ctx, flow_id, output_format):
 @click.option('--output-file', type=click.Path(), help='Output file for results (for JSON or other formats)')
 @click.option("--format", type=click.Choice(['json', 'csv']), default='csv', help='Output format for results (default: csv)')
 @click.option('--overwrite', is_flag=True, help='Overwrite existing files')
-@click.option('--check-interval', type=int, default=10, help='Seconds between result checks (default: 10)')
+@click.option('--check-interval', type=int, default=2, help='Seconds between result checks (default: 2)')
 @click.option('--max-parallel', type=int, default=50, help='Maximum number of tasks to schedule in parallel (default: 50)')
+@click.option('--sequential', is_flag=True, help='Force sequential execution instead of default parallel processing')
 @click.pass_context
-def batch_run(ctx, input_file, flow_id, output_dir, output_file, format, overwrite, check_interval, max_parallel):
+def batch_run(ctx, input_file, flow_id, output_dir, output_file, format, overwrite, check_interval, max_parallel, sequential):
     """Run a flow in batch mode with multiple inputs.
     
     Supported input formats:
@@ -300,35 +306,51 @@ def batch_run(ctx, input_file, flow_id, output_dir, output_file, format, overwri
     FLOW_ID: The FlowHunt flow ID to execute
     """
     verbose = ctx.obj.get('verbose', False)
+    logger = Logger(verbose=verbose)
     
     # Validate that output_dir and output_file are not both specified
     if output_dir and output_file:
-        click.echo("Error: --output-dir and --output-file cannot be used together. Choose one.", err=True)
+        logger.error("--output-dir and --output-file cannot be used together. Choose one.")
         sys.exit(1)
     
-    if verbose:
-        click.echo(f"Running batch execution for flow {flow_id}")
-        click.echo(f"Input file: {input_file}")
-        if output_dir:
-            click.echo(f"Output directory: {output_dir}")
-        if output_file:
-            click.echo(f"Output file: {output_file}")
+    # Log command start with configuration
+    config_args = {
+        'input_file': input_file,
+        'flow_id': flow_id,
+        'output_dir': output_dir,
+        'output_file': output_file,
+        'format': format,
+        'overwrite': overwrite,
+        'check_interval': f"{check_interval}s",
+        'max_parallel': max_parallel,
+        'mode': 'sequential' if sequential else 'parallel (default)'
+    }
+    logger.command_start('batch-run', config_args)
+    
+    # Add tip about check interval if it seems high
+    if check_interval > 5 and not sequential:
+        logger.warning(f"Check interval is {check_interval}s - consider using --check-interval=2 for faster feedback")
+
+    start_time = time.time()
 
     try:
         # Initialize FlowHunt client
+        logger.progress_start("Initializing FlowHunt client...")
         try:
             client = FlowHuntClient.from_config_file()
+            logger.progress_done("FlowHunt client initialized")
         except FileNotFoundError:
-            click.echo("Error: No FlowHunt configuration found. Please run 'flowhunt auth' first.", err=True)
+            logger.error("No FlowHunt configuration found. Please run 'flowhunt auth' first.")
             sys.exit(1)
         except Exception as e:
-            click.echo(f"Error: Failed to initialize FlowHunt client: {str(e)}", err=True)
+            logger.error(f"Failed to initialize FlowHunt client: {str(e)}")
             sys.exit(1)
         
         input_path = Path(input_file)
         
         # Check if this is a CSV file with the expected format for batch processing
         if input_path.suffix.lower() == '.csv':
+            logger.progress_start("Analyzing CSV file format...")
             try:
                 # Validate CSV format and columns
                 import csv
@@ -338,7 +360,7 @@ def batch_run(ctx, input_file, flow_id, output_dir, output_file, format, overwri
                     
                     # Check if CSV has headers
                     if not fieldnames:
-                        click.echo("Error: CSV file must have headers.", err=True)
+                        logger.error("CSV file must have headers.")
                         sys.exit(1)
                     
                     # Define allowed columns
@@ -349,14 +371,14 @@ def batch_run(ctx, input_file, flow_id, output_dir, output_file, format, overwri
                     # Check for mandatory columns
                     missing_mandatory = mandatory_columns - set(fieldnames)
                     if missing_mandatory:
-                        click.echo(f"Error: CSV file must contain the following mandatory column(s): {', '.join(missing_mandatory)}", err=True)
+                        logger.error(f"CSV file must contain the following mandatory column(s): {', '.join(missing_mandatory)}")
                         sys.exit(1)
                     
                     # Check for invalid columns
                     invalid_columns = set(fieldnames) - allowed_columns
                     if invalid_columns:
-                        click.echo(f"Error: CSV file contains invalid column(s): {', '.join(invalid_columns)}", err=True)
-                        click.echo(f"Allowed columns are: {', '.join(sorted(allowed_columns))}", err=True)
+                        logger.error(f"CSV file contains invalid column(s): {', '.join(invalid_columns)}")
+                        logger.info(f"Allowed columns are: {', '.join(sorted(allowed_columns))}")
                         sys.exit(1)
                     
                     # Check if filename column exists and output_dir is required
@@ -364,51 +386,98 @@ def batch_run(ctx, input_file, flow_id, output_dir, output_file, format, overwri
                     has_flow_variable = 'flow_variable' in fieldnames
                     
                     if has_filename and not output_dir:
-                        click.echo("Error: --output-dir is required when CSV file contains 'filename' column.", err=True)
+                        logger.error("--output-dir is required when CSV file contains 'filename' column.")
                         sys.exit(1)
                     
                     # Check if output_dir is specified without filename column
                     if not has_filename and output_dir:
-                        click.echo("Error: --output-dir only makes sense when CSV file contains 'filename' column.", err=True)
+                        logger.error("--output-dir only makes sense when CSV file contains 'filename' column.")
                         sys.exit(1)
                 
+                logger.progress_done("CSV format validated")
+                
                 # If we reach here, CSV validation passed
-                # Use optimized batch processing if we have filename or flow_variable columns
-                if has_filename or has_flow_variable:
-                    if has_filename:
-                        click.echo("Using optimized batch processing for CSV with flow_input/filename columns...")
+                # Use parallel processing by default unless --sequential is specified
+                if not sequential:
+                    # Parallel execution is now the default
+                    if not (has_filename or has_flow_variable):
+                        logger.info("🚀 Using parallel batch processing (default mode)")
+                        logger.info("💡 Results will be saved to output file. Use --sequential for one-by-one processing.")
+                        # For parallel without filename column, we need to set output_dir to None
+                        # Results will be aggregated in memory and saved to output_file
+                        output_dir_for_batch = None
+                        force_parallel = True  # Signal to aggregate results
                     else:
-                        click.echo("Using optimized batch processing for CSV with flow_input/flow_variable columns...")
+                        output_dir_for_batch = output_dir
+                        force_parallel = False
+                        if has_filename:
+                            logger.info("Using parallel batch processing with individual file outputs")
+                        else:
+                            logger.info("Using parallel batch processing with flow variables")
                     
+                    logger.progress_start("Starting parallel batch execution...")
                     stats = client.batch_execute_from_csv(
                         csv_file=str(input_path),
                         flow_id=flow_id,
-                        output_dir=output_dir,
+                        output_dir=output_dir_for_batch,
                         overwrite=overwrite,
                         check_interval=check_interval,
-                        max_parallel=max_parallel
+                        max_parallel=max_parallel,
+                        force_parallel=force_parallel
                     )
                     
-                    click.echo(f"\nBatch execution completed!")
-                    click.echo(f"Total inputs: {stats['total']}")
-                    click.echo(f"Completed successfully: {stats['completed']}")
-                    click.echo(f"Failed: {stats['failed']}")
-                    click.echo(f"Skipped (files already exist): {stats['skipped']}")
+                    duration = time.time() - start_time
+                    logger.progress_done("Batch execution completed", duration)
+                    
+                    # Display results
+                    logger.stats_table("Execution Results", {
+                        "Total inputs": stats['total'],
+                        "Completed successfully": stats['completed'],
+                        "Failed": stats['failed'],
+                        "Skipped (files already exist)": stats['skipped']
+                    })
+                    
+                    # If force_parallel without filename, results are in stats['results']
+                    if force_parallel and not has_filename and 'results' in stats:
+                        # Generate automatic output file if not specified
+                        if not output_file:
+                            current_date = datetime.now().strftime("%Y-%m-%d")
+                            output_file = f"{current_date}-{flow_id}-output.{format}"
+                            logger.info(f"Saving aggregated results to: {output_file}")
+                        
+                        # Save aggregated results
+                        logger.progress_start(f"Saving results to {output_file}...")
+                        try:
+                            output_path = Path(output_file)
+                            
+                            if format == 'csv' or output_path.suffix.lower() == '.csv':
+                                import pandas as pd
+                                df = pd.DataFrame(stats['results'])
+                                df.to_csv(output_path, index=False)
+                            else:
+                                import json
+                                with open(output_path, 'w') as f:
+                                    json.dump(stats['results'], f, indent=2)
+                            
+                            logger.progress_done(f"Results saved to {output_file}")
+                        except Exception as e:
+                            logger.warning(f"Failed to save results: {str(e)}")
                     
                     return
                 else:
-                    # CSV has only flow_input - fall through to standard processing
-                    click.echo("Processing CSV with flow_input column using standard method...")
+                    # User explicitly requested sequential processing
+                    logger.info("📝 Using sequential processing (--sequential flag specified)")
+                    logger.warning("Sequential processing is slower. Remove --sequential flag for parallel execution.")
                     
             except Exception as e:
                 if "CSV file must have headers" in str(e) or "CSV file must contain" in str(e) or "CSV file contains invalid" in str(e) or "--output-dir is required" in str(e):
                     # Re-raise validation errors
                     raise
-                if verbose:
-                    click.echo(f"Could not use optimized batch processing: {e}")
-                click.echo("Falling back to standard processing...")
+                logger.debug(f"Could not use optimized batch processing: {e}")
+                logger.warning("Falling back to standard sequential processing...")
         
         # Standard processing for other formats or CSV without expected columns
+        logger.progress_start("Loading input data...")
         inputs_list = []
         try:
             if input_path.suffix.lower() == '.csv':
@@ -429,71 +498,181 @@ def batch_run(ctx, input_file, flow_id, output_dir, output_file, format, overwri
                     lines = [line.strip() for line in f.readlines() if line.strip()]
                     inputs_list = [{'flow_input': line} for line in lines]
             else:
-                click.echo(f"Error: Unsupported file format. Use .csv, .json, or .txt files.", err=True)
+                logger.error("Unsupported file format. Use .csv, .json, or .txt files.")
                 sys.exit(1)
                 
-            click.echo(f"Loaded {len(inputs_list)} inputs from {input_file}")
+            logger.progress_done(f"Loaded {len(inputs_list)} inputs from {input_file}")
             
         except Exception as e:
-            click.echo(f"Error: Failed to load input file: {str(e)}", err=True)
+            logger.error(f"Failed to load input file: {str(e)}")
             sys.exit(1)
         
         # Generate automatic output file if not specified
         if not output_file:
-            from datetime import datetime
             current_date = datetime.now().strftime("%Y-%m-%d")
             output_file = f"{current_date}-{flow_id}-output.{format}"
-            click.echo(f"No output file specified. Results will be saved to: {output_file}")
+            logger.info(f"Auto-generating output file: {output_file}")
         
-        # Execute flows sequentially
-        results = []
-        click.echo("Starting batch execution...")
-        
-        with click.progressbar(inputs_list, label='Processing') as bar:
-            for i, inputs in enumerate(bar):
-                try:
-                    # Convert inputs to variables and human_input format
-                    if isinstance(inputs, dict):
-                        # Use 'flow_input' key if present, otherwise use 'human_input' key, otherwise use all as variables
-                        if 'flow_input' in inputs:
-                            human_input = inputs.pop('flow_input', '')
-                            variables = inputs
+        # Check if user wants sequential or parallel (default)
+        if sequential:
+            # Sequential processing
+            logger.info("📝 Using sequential processing (--sequential flag specified)")
+            logger.warning("Sequential processing is slower. Remove --sequential flag for parallel execution.")
+            logger.progress_start("Starting sequential batch execution...")
+            
+            results = []
+            successful = 0
+            failed = 0
+            console = Console()
+            
+            # Use Rich progress bar for sequential processing
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(complete_style="yellow", finished_style="bold yellow"),
+                TaskProgressColumn(),
+                TextColumn("•"),
+                TimeRemainingColumn(),
+                console=console,
+                transient=False
+            ) as progress:
+                
+                task = progress.add_task(
+                    "[yellow]Sequential processing...", 
+                    total=len(inputs_list)
+                )
+                
+                for i, inputs in enumerate(inputs_list):
+                    try:
+                        # Convert inputs to variables and human_input format
+                        if isinstance(inputs, dict):
+                            # Use 'flow_input' key if present, otherwise use 'human_input' key, otherwise use all as variables
+                            if 'flow_input' in inputs:
+                                human_input = inputs.pop('flow_input', '')
+                                variables = inputs
+                            else:
+                                human_input = inputs.pop('human_input', '')
+                                variables = inputs
                         else:
-                            human_input = inputs.pop('human_input', '')
-                            variables = inputs
-                    else:
-                        human_input = str(inputs)
-                        variables = {}
+                            human_input = str(inputs)
+                            variables = {}
+                        
+                        # Update progress description with current task info
+                        progress.update(
+                            task, 
+                            description=f"[yellow]Sequential[/yellow] │ [green]{successful} ✓[/green] [red]{failed} ✗[/red] │ {human_input[:30]}{'...' if len(human_input) > 30 else ''}"
+                        )
+                        
+                        result = client.execute_flow(flow_id, variables=variables, human_input=human_input)
+                        results.append({
+                            'input_index': i,
+                            'flow_input': human_input,
+                            'variables': variables,
+                            'result': result,
+                            'status': 'success'
+                        })
+                        successful += 1
+                        
+                        if verbose:
+                            console.print(f"[green]✓[/green] Flow {i+1}/{len(inputs_list)} completed successfully")
+                            
+                    except Exception as e:
+                        results.append({
+                            'input_index': i,
+                            'flow_input': human_input if 'human_input' in locals() else str(inputs),
+                            'variables': variables if 'variables' in locals() else {},
+                            'result': None,
+                            'status': 'error',
+                            'error': str(e)
+                        })
+                        failed += 1
+                        
+                        if verbose:
+                            console.print(f"[red]✗[/red] Flow {i+1}/{len(inputs_list)} failed: {str(e)}")
                     
-                    result = client.execute_flow(flow_id, variables=variables, human_input=human_input)
-                    results.append({
-                        'input_index': i,
-                        'flow_input': human_input,
-                        'variables': variables,
-                        'result': result,
-                        'status': 'success'
-                    })
-                except Exception as e:
-                    results.append({
-                        'input_index': i,
-                        'flow_input': human_input if 'human_input' in locals() else str(inputs),
-                        'variables': variables if 'variables' in locals() else {},
-                        'result': None,
-                        'status': 'error',
-                        'error': str(e)
-                    })
-        
-        # Display summary
-        successful = len([r for r in results if r['status'] == 'success'])
-        failed = len(results) - successful
-        
-        click.echo(f"\nBatch execution completed!")
-        click.echo(f"Total inputs: {len(results)}")
-        click.echo(f"Successful: {successful}")
-        click.echo(f"Failed: {failed}")
+                    progress.advance(task, 1)
+            
+            duration = time.time() - start_time
+            logger.progress_done("Sequential execution completed", duration)
+            
+            # Display summary
+            logger.stats_table("Execution Results", {
+                "Total inputs": len(results),
+                "Successful": successful,
+                "Failed": failed
+            })
+        else:
+            # Parallel processing (DEFAULT)
+            logger.info("🚀 Using parallel batch processing (default mode)")
+            logger.progress_start("Starting parallel batch execution...")
+            
+            # Convert inputs_list to topics format for batch processing
+            topics = []
+            for i, inputs in enumerate(inputs_list):
+                if isinstance(inputs, dict):
+                    if 'flow_input' in inputs:
+                        topic = {'flow_input': inputs['flow_input']}
+                        # Add other fields as flow_variable
+                        remaining = {k: v for k, v in inputs.items() if k != 'flow_input'}
+                        if remaining:
+                            topic['flow_variable'] = remaining
+                    else:
+                        # Use all as flow_variable
+                        topic = {'flow_input': str(inputs), 'flow_variable': inputs}
+                else:
+                    topic = {'flow_input': str(inputs)}
+                topics.append(topic)
+            
+            # Create temporary CSV for batch processing
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as temp_csv:
+                import csv as csv_module
+                fieldnames = ['flow_input']
+                if any('flow_variable' in t for t in topics):
+                    fieldnames.append('flow_variable')
+                
+                writer = csv_module.DictWriter(temp_csv, fieldnames=fieldnames)
+                writer.writeheader()
+                
+                for topic in topics:
+                    row = {'flow_input': topic['flow_input']}
+                    if 'flow_variable' in topic:
+                        import json
+                        row['flow_variable'] = json.dumps(topic['flow_variable'])
+                    writer.writerow(row)
+                
+                temp_csv_path = temp_csv.name
+            
+            # Run parallel batch processing
+            stats = client.batch_execute_from_csv(
+                csv_file=temp_csv_path,
+                flow_id=flow_id,
+                output_dir=None,  # No output dir for aggregated results
+                overwrite=overwrite,
+                check_interval=check_interval,
+                max_parallel=max_parallel,
+                force_parallel=True  # Force parallel for aggregated results
+            )
+            
+            # Clean up temp file
+            Path(temp_csv_path).unlink()
+            
+            duration = time.time() - start_time
+            logger.progress_done("Parallel execution completed", duration)
+            
+            # Display results
+            logger.stats_table("Execution Results", {
+                "Total inputs": stats['total'],
+                "Completed successfully": stats['completed'],
+                "Failed": stats['failed']
+            })
+            
+            # Get results from stats
+            results = stats.get('results', [])
         
         # Save results if output file specified or auto-generated
-        if output_file:
+        if output_file and results:
+            logger.progress_start(f"Saving results to {output_file}...")
             try:
                 output_path = Path(output_file)
                 
@@ -526,15 +705,15 @@ def batch_run(ctx, input_file, flow_id, output_dir, output_file, format, overwri
                     with open(output_path, 'w') as f:
                         json.dump(results, f, indent=2)
                 
-                click.echo(f"Results saved to {output_file}")
+                logger.progress_done(f"Results saved to {output_file}")
             except Exception as e:
-                click.echo(f"Warning: Failed to save results: {str(e)}", err=True)
+                logger.warning(f"Failed to save results: {str(e)}")
 
     except KeyboardInterrupt:
-        click.echo("\nBatch execution interrupted by user.", err=True)
+        logger.error("Batch execution interrupted by user")
         sys.exit(1)
     except Exception as e:
-        click.echo(f"Error: {str(e)}", err=True)
+        logger.error(f"Batch execution failed: {str(e)}")
         sys.exit(1)
 
 

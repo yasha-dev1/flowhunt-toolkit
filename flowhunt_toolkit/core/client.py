@@ -6,7 +6,13 @@ import json
 import time
 import csv
 from pathlib import Path
-from tqdm import tqdm
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn, TimeElapsedColumn
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+from rich.live import Live
+from rich import box
 
 
 class FlowHuntClient:
@@ -206,21 +212,22 @@ class FlowHuntClient:
             except self.flowhunt.ApiException as e:
                 raise Exception(f"Failed to list flows: {e}")
     
-    def batch_execute_from_csv(self, csv_file: str, flow_id: str, output_dir: str, 
+    def batch_execute_from_csv(self, csv_file: str, flow_id: str, output_dir: str = None, 
                               overwrite: bool = False, check_interval: int = 10, 
-                              max_parallel: int = 50) -> Dict[str, int]:
+                              max_parallel: int = 50, force_parallel: bool = False) -> Dict[str, Any]:
         """Execute a flow for each row in a CSV file.
         
         Args:
-            csv_file: Path to CSV file with 'flow_input' and 'filename' columns
+            csv_file: Path to CSV file with 'flow_input' and optional 'filename'/'flow_variable' columns
             flow_id: FlowHunt flow ID to execute
-            output_dir: Directory to save output files
+            output_dir: Directory to save output files (optional, required if filename column exists)
             overwrite: Whether to overwrite existing files
             check_interval: Seconds between result checks
             max_parallel: Maximum number of tasks to schedule in parallel
+            force_parallel: Force parallel execution even without filename/flow_variable columns
             
         Returns:
-            Dictionary with execution statistics
+            Dictionary with execution statistics and optionally results
         """
         # Read CSV file
         topics = self._read_csv_topics(csv_file)
@@ -237,7 +244,9 @@ class FlowHuntClient:
             return {"completed": 0, "failed": 0, "skipped": skipped_count, "total": skipped_count}
         
         # Execute batch processing
-        return self._process_batch_topics(topics, flow_id, output_dir, check_interval, skipped_count, max_parallel)
+        stats = self._process_batch_topics(topics, flow_id, output_dir, check_interval, skipped_count, max_parallel, force_parallel)
+        
+        return stats
     
     def _read_csv_topics(self, csv_file: str) -> List[Dict[str, Any]]:
         """Read topics from CSV file."""
@@ -316,9 +325,10 @@ class FlowHuntClient:
     
     def _process_batch_topics(self, topics: List[Dict[str, str]], flow_id: str, 
                              output_dir: str, check_interval: int, skipped_count: int, 
-                             max_parallel: int = 50) -> Dict[str, int]:
-        """Process topics in batch with controlled parallelism."""
+                             max_parallel: int = 50, force_parallel: bool = False) -> Dict[str, Any]:
+        """Process topics in batch with controlled parallelism and beautiful progress display."""
         workspace_id = self.get_workspace_id()
+        console = Console()
         
         with self.flowhunt.ApiClient(self.configuration) as api_client:
             api_instance = self.flowhunt.FlowsApi(api_client)
@@ -329,84 +339,251 @@ class FlowHuntClient:
             failed_tasks = []
             topics_queue = topics.copy()
             
-            print(f"Processing {len(topics)} tasks with max {max_parallel} parallel tasks...")
-            total_progress = tqdm(total=len(topics), desc="Total Progress")
+            # Store results when force_parallel without output_dir
+            all_results = [] if (force_parallel and not output_dir) else None
             
-            while topics_queue or pending_tasks:
-                # Schedule new tasks up to max_parallel limit
-                while len(pending_tasks) < max_parallel and topics_queue:
-                    topic = topics_queue.pop(0)
-                    
-                    try:
-                        # Build variables dictionary
-                        variables = {}
-                        
-                        # Add filename if present
-                        if 'filename' in topic:
-                            variables["filename"] = topic['filename']
-                        
-                        # Merge flow_variable JSON if present
-                        if 'flow_variable' in topic and isinstance(topic['flow_variable'], dict):
-                            variables.update(topic['flow_variable'])
-                        
-                        flow_invoke_request = self.flowhunt.FlowInvokeRequest(
-                            variables=variables,
-                            human_input=topic['flow_input']
-                        )
-                        
-                        response = api_instance.invoke_flow_singleton(
-                            flow_id=flow_id,
-                            workspace_id=workspace_id,
-                            flow_invoke_request=flow_invoke_request
-                        )
-                        
-                        pending_tasks[response.id] = topic
-                        
-                    except Exception as e:
-                        print(f"Failed to schedule task for '{topic['flow_input']}': {e}")
-                        failed_tasks.append(topic)
-                        total_progress.update(1)
+            # Create a beautiful header
+            header_panel = Panel(
+                f"[bold cyan]🚀 PARALLEL BATCH EXECUTION[/bold cyan]\n"
+                f"[dim]Processing {len(topics)} tasks with max {max_parallel} parallel workers[/dim]\n"
+                f"[dim]Flow ID: {flow_id[:8]}...{flow_id[-8:] if len(flow_id) > 16 else flow_id}[/dim]",
+                box=box.ROUNDED,
+                border_style="cyan"
+            )
+            console.print(header_panel)
+            
+            # Create Rich progress display with multiple tasks
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(complete_style="green", finished_style="bold green"),
+                TaskProgressColumn(),
+                TextColumn("•"),
+                TimeElapsedColumn(),
+                TextColumn("•"),
+                TimeRemainingColumn(),
+                console=console,
+                transient=False
+            ) as progress:
                 
-                # Check for completed tasks
-                if pending_tasks:
-                    time.sleep(check_interval)
-                    process_ids = list(pending_tasks.keys())
-                    completed_in_batch = 0
+                # Create two progress bars - one for scheduling, one for completion
+                schedule_task = progress.add_task(
+                    "[blue]Scheduling tasks...", 
+                    total=len(topics)
+                )
+                
+                complete_task = progress.add_task(
+                    "[cyan]Completing flows...", 
+                    total=len(topics)
+                )
+                
+                # Statistics tracking
+                start_time = time.time()
+                batch_cycle = 0
+                total_scheduled = 0
+                
+                # Create a status table for live updates
+                status_table = Table(show_header=True, header_style="bold magenta", box=box.SIMPLE)
+                status_table.add_column("Metric", style="cyan", width=12)
+                status_table.add_column("Value", style="white", width=10)
+                status_table.add_column("Details", style="dim", width=30)
+                
+                while topics_queue or pending_tasks:
+                    batch_cycle += 1
                     
-                    for process_id in process_ids:
-                        topic_data = pending_tasks[process_id]
+                    # Schedule new tasks up to max_parallel limit
+                    scheduled_this_cycle = 0
+                    while len(pending_tasks) < max_parallel and topics_queue:
+                        topic = topics_queue.pop(0)
                         
                         try:
-                            is_ready, content = self.get_flow_results(flow_id, process_id)
+                            # Build variables dictionary
+                            variables = {}
                             
-                            if is_ready:
-                                del pending_tasks[process_id]
-                                completed_in_batch += 1
-                                
-                                if content and content != "NOCONTENT":
-                                    # Only save to file if filename is provided and output_dir exists
-                                    if 'filename' in topic_data and output_dir:
-                                        self._save_content(content, topic_data['filename'], output_dir)
-                                    completed_tasks.append(topic_data)
-                                else:
-                                    failed_tasks.append(topic_data)
-                                    
+                            # Add filename if present
+                            if 'filename' in topic:
+                                variables["filename"] = topic['filename']
+                            
+                            # Merge flow_variable JSON if present
+                            if 'flow_variable' in topic and isinstance(topic['flow_variable'], dict):
+                                variables.update(topic['flow_variable'])
+                            
+                            flow_invoke_request = self.flowhunt.FlowInvokeRequest(
+                                variables=variables,
+                                human_input=topic['flow_input']
+                            )
+                            
+                            response = api_instance.invoke_flow_singleton(
+                                flow_id=flow_id,
+                                workspace_id=workspace_id,
+                                flow_invoke_request=flow_invoke_request
+                            )
+                            
+                            pending_tasks[response.id] = topic
+                            scheduled_this_cycle += 1
+                            total_scheduled += 1
+                            progress.advance(schedule_task, 1)  # Update scheduling progress immediately
+                            
                         except Exception as e:
-                            print(f"Error processing task {process_id}: {e}")
-                            del pending_tasks[process_id]
-                            failed_tasks.append(topic_data)
-                            completed_in_batch += 1
+                            console.print(f"[red]✗[/red] Failed to schedule task: {str(e)[:60]}...")
+                            failed_tasks.append(topic)
+                            total_scheduled += 1
+                            progress.advance(schedule_task, 1)  # Count as scheduled
+                            progress.advance(complete_task, 1)  # Also count as complete (failed)
                     
-                    total_progress.update(completed_in_batch)
+                    # Update progress descriptions with current status
+                    elapsed = time.time() - start_time
+                    running = len(pending_tasks)
+                    queued = len(topics_queue)
+                    completed = len(completed_tasks) + len(failed_tasks)
+                    
+                    progress.update(
+                        schedule_task,
+                        description=f"[blue]Scheduling[/blue] │ {total_scheduled}/{len(topics)} scheduled"
+                    )
+                    
+                    progress.update(
+                        complete_task,
+                        description=f"[cyan]Completing[/cyan] │ [green]{len(completed_tasks)} ✓[/green] [red]{len(failed_tasks)} ✗[/red] [yellow]{running} ⚡[/yellow]"
+                    )
+                    
+                    # Check for completed tasks
+                    if pending_tasks:
+                        # Show message when all tasks are scheduled
+                        if total_scheduled == len(topics) and batch_cycle == 1:
+                            console.print(f"[bold green]✅ All {len(topics)} tasks scheduled! Checking for results every {check_interval}s...[/bold green]")
+                        
+                        time.sleep(check_interval)
+                        process_ids = list(pending_tasks.keys())
+                        completed_in_batch = 0
+                        failed_in_batch = 0
+                        
+                        # Log checking status
+                        if batch_cycle % 5 == 0:  # Log every 5 cycles
+                            console.print(f"[dim]🔍 Checking {len(process_ids)} pending tasks... (cycle {batch_cycle})[/dim]")
+                        
+                        for process_id in process_ids:
+                            topic_data = pending_tasks[process_id]
+                            
+                            try:
+                                is_ready, content = self.get_flow_results(flow_id, process_id)
+                                
+                                if is_ready:
+                                    del pending_tasks[process_id]
+                                    completed_in_batch += 1
+                                    
+                                    if content and content != "NOCONTENT":
+                                        # Only save to file if filename is provided and output_dir exists
+                                        if 'filename' in topic_data and output_dir:
+                                            self._save_content(content, topic_data['filename'], output_dir)
+                                        
+                                        # Store result if force_parallel without output_dir
+                                        if all_results is not None:
+                                            result_entry = {
+                                                'flow_input': topic_data['flow_input'],
+                                                'result': content,
+                                                'status': 'success'
+                                            }
+                                            # Add flow_variable if present
+                                            if 'flow_variable' in topic_data:
+                                                result_entry['flow_variable'] = topic_data['flow_variable']
+                                            all_results.append(result_entry)
+                                        
+                                        completed_tasks.append(topic_data)
+                                    else:
+                                        failed_tasks.append(topic_data)
+                                        failed_in_batch += 1
+                                        
+                                        # Store failed result if force_parallel without output_dir
+                                        if all_results is not None:
+                                            result_entry = {
+                                                'flow_input': topic_data['flow_input'],
+                                                'result': None,
+                                                'status': 'failed',
+                                                'error': 'No content returned'
+                                            }
+                                            if 'flow_variable' in topic_data:
+                                                result_entry['flow_variable'] = topic_data['flow_variable']
+                                            all_results.append(result_entry)
+                                        
+                            except Exception as e:
+                                console.print(f"[red]✗[/red] Processing error: {str(e)[:60]}...")
+                                del pending_tasks[process_id]
+                                failed_tasks.append(topic_data)
+                                completed_in_batch += 1
+                                failed_in_batch += 1
+                                
+                                # Store error result if force_parallel without output_dir
+                                if all_results is not None:
+                                    result_entry = {
+                                        'flow_input': topic_data['flow_input'],
+                                        'result': None,
+                                        'status': 'error',
+                                        'error': str(e)
+                                    }
+                                    if 'flow_variable' in topic_data:
+                                        result_entry['flow_variable'] = topic_data['flow_variable']
+                                    all_results.append(result_entry)
+                        
+                        # Advance progress
+                        if completed_in_batch > 0:
+                            progress.advance(complete_task, completed_in_batch)
+                            
+                            # Show batch completion with emojis based on results
+                            if failed_in_batch == 0:
+                                console.print(f"[green]✓[/green] Cycle {batch_cycle}: {completed_in_batch} tasks completed successfully")
+                            else:
+                                success_in_batch = completed_in_batch - failed_in_batch
+                                console.print(f"[yellow]⚠[/yellow] Cycle {batch_cycle}: {success_in_batch} success, {failed_in_batch} failed")
             
-            total_progress.close()
+            # Final beautiful summary
+            total_time = time.time() - start_time
+            success_rate = (len(completed_tasks) / len(topics) * 100) if topics else 0
+            throughput = len(topics) / total_time if total_time > 0 else 0
+            
+            # Create summary table
+            summary_table = Table(
+                title="[bold]📊 Execution Summary[/bold]",
+                show_header=True,
+                header_style="bold magenta",
+                box=box.ROUNDED,
+                border_style="cyan"
+            )
+            summary_table.add_column("Metric", style="cyan", justify="left")
+            summary_table.add_column("Count", style="white", justify="right")
+            summary_table.add_column("Percentage", style="green", justify="right")
+            
+            summary_table.add_row("✅ Completed", str(len(completed_tasks)), f"{success_rate:.1f}%")
+            summary_table.add_row("❌ Failed", str(len(failed_tasks)), f"{(len(failed_tasks)/len(topics)*100):.1f}%" if topics else "0%")
+            summary_table.add_row("⏭️ Skipped", str(skipped_count), f"{(skipped_count/(len(topics)+skipped_count)*100):.1f}%" if topics else "0%")
+            summary_table.add_row("📊 Total", str(len(topics) + skipped_count), "100%")
+            
+            console.print(summary_table)
+            
+            # Performance metrics
+            perf_panel = Panel(
+                f"[bold cyan]⚡ Performance Metrics[/bold cyan]\n"
+                f"[green]⏱️ Total time:[/green] {total_time:.1f} seconds\n"
+                f"[green]🚀 Throughput:[/green] {throughput:.1f} tasks/second\n"
+                f"[green]🔥 Peak parallel:[/green] {max_parallel} workers\n"
+                f"[green]🎯 Success rate:[/green] {success_rate:.1f}%",
+                box=box.ROUNDED,
+                border_style="green"
+            )
+            console.print(perf_panel)
         
-        return {
+        result_dict = {
             "completed": len(completed_tasks),
             "failed": len(failed_tasks),
             "skipped": skipped_count,
             "total": len(topics) + skipped_count
         }
+        
+        # Include results if force_parallel without output_dir
+        if all_results is not None:
+            result_dict["results"] = all_results
+        
+        return result_dict
     
     def _save_content(self, content: str, filename: str, output_dir: str) -> None:
         """Save content to file."""
