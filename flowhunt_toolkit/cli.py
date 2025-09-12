@@ -13,7 +13,9 @@ from rich.console import Console
 from . import __version__
 from .core.client import FlowHuntClient
 from .core.evaluator import FlowEvaluator
+from .core.liveagent_client import LiveAgentClient
 from .utils.logger import Logger
+import pandas as pd
 
 
 @click.group()
@@ -734,7 +736,8 @@ def auth(ctx):
 
     try:
         # Test the credentials by creating a client and making a simple API call
-        client = FlowHuntClient(api_key=api_key, base_url="https://api.flowhunt.io")
+        # TODO - temporarily changing to local to test memory real quick
+        client = FlowHuntClient(api_key=api_key, base_url="http://localhost:9011")
         
         click.echo("Testing API connection...")
         # Try to list flows to verify the credentials work
@@ -848,6 +851,258 @@ def list(ctx, output_format):
         
     except Exception as e:
         click.echo(f"Error: {str(e)}", err=True)
+        sys.exit(1)
+
+
+@main.group()
+@click.pass_context
+def index(ctx):
+    """Index external data sources into FlowHunt.
+    
+    This command group provides utilities for indexing data from various
+    external sources by processing them through FlowHunt flows.
+    """
+    pass
+
+
+@index.command()
+@click.argument('base_url', type=str)
+@click.argument('index_flow_id', type=str)
+@click.argument('department_id', type=str, required=False)
+@click.option('--api-key', required=True, help='LiveAgent API key (read-only for tickets)')
+@click.option('--limit', type=int, default=100, help='Maximum number of tickets to index (default: 100)')
+@click.option('--output-csv', type=click.Path(), help='Path to save checkpoint CSV (default: liveagent_index_YYYYMMDD.csv)')
+@click.option('--resume', is_flag=True, help='Resume from existing checkpoint CSV')
+@click.pass_context
+def liveagent(ctx, base_url, index_flow_id, department_id, api_key, limit, output_csv, resume):
+    """Index closed LiveAgent tickets into FlowHunt.
+    
+    This command fetches closed/resolved tickets from LiveAgent, formats them as text,
+    and processes them through a FlowHunt flow for indexing. Only closed tickets are
+    indexed to ensure complete conversation history.
+    
+    BASE_URL: LiveAgent instance URL (e.g., https://support.qualityunit.com)
+    INDEX_FLOW_ID: FlowHunt flow ID to use for indexing
+    DEPARTMENT_ID: Optional department ID to filter tickets (e.g., 31ivft8h)
+    """
+    verbose = ctx.obj.get('verbose', False)
+    logger = Logger(verbose=verbose)
+    
+    # Generate default CSV filename if not provided
+    if not output_csv:
+        current_date = datetime.now().strftime("%Y%m%d")
+        output_csv = f"liveagent_index_{current_date}.csv"
+    
+    output_path = Path(output_csv)
+    
+    # Log command start
+    config_args = {
+        'base_url': base_url,
+        'index_flow_id': index_flow_id,
+        'department_id': department_id or 'All departments',
+        'limit': limit,
+        'output_csv': str(output_path),
+        'resume': resume
+    }
+    logger.command_start('index liveagent', config_args)
+    
+    start_time = time.time()
+    
+    try:
+        # Initialize FlowHunt client
+        logger.progress_start("Initializing FlowHunt client...")
+        try:
+            flowhunt_client = FlowHuntClient.from_config_file()
+            logger.progress_done("FlowHunt client initialized")
+        except FileNotFoundError:
+            logger.error("No FlowHunt configuration found. Please run 'flowhunt auth' first.")
+            sys.exit(1)
+        except Exception as e:
+            logger.error(f"Failed to initialize FlowHunt client: {str(e)}")
+            sys.exit(1)
+        
+        # Initialize LiveAgent client
+        logger.progress_start("Initializing LiveAgent client...")
+        try:
+            liveagent_client = LiveAgentClient(base_url, api_key)
+            logger.progress_done("LiveAgent client initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize LiveAgent client: {str(e)}")
+            sys.exit(1)
+        
+        # Check for existing checkpoint
+        indexed_tickets = set()
+        checkpoint_data = []
+        
+        if resume and output_path.exists():
+            logger.progress_start(f"Loading checkpoint from {output_csv}...")
+            try:
+                existing_df = pd.read_csv(output_path)
+                indexed_tickets = set(existing_df['ticket_id'].astype(str))
+                checkpoint_data = existing_df.to_dict('records')
+                logger.progress_done(f"Loaded checkpoint with {len(indexed_tickets)} already indexed tickets")
+            except Exception as e:
+                logger.warning(f"Failed to load checkpoint: {str(e)}")
+        
+        # Fetch tickets from LiveAgent
+        logger.progress_start(f"Fetching tickets from LiveAgent (limit: {limit})...")
+        try:
+            tickets = liveagent_client.paginate_all_tickets(
+                department_id=department_id,  # Pass department_id for filtering
+                max_tickets=limit
+            )
+            logger.progress_done(f"Fetched {len(tickets)} tickets from LiveAgent")
+        except Exception as e:
+            logger.error(f"Failed to fetch tickets: {str(e)}")
+            sys.exit(1)
+        
+        # Filter out already indexed tickets if resuming
+        if resume and indexed_tickets:
+            original_count = len(tickets)
+            tickets = [t for t in tickets if str(t.get('id', '')) not in indexed_tickets]
+            if original_count != len(tickets):
+                logger.info(f"Skipping {original_count - len(tickets)} already indexed tickets")
+        
+        if not tickets:
+            logger.info("No new tickets to index")
+            return
+        
+        # Process tickets
+        logger.info(f"Starting to index {len(tickets)} tickets...")
+        
+        successful = 0
+        failed = 0
+        console = Console()
+        
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(complete_style="green", finished_style="bold green"),
+            TaskProgressColumn(),
+            TextColumn("•"),
+            TimeRemainingColumn(),
+            console=console,
+            transient=False
+        ) as progress:
+            
+            task = progress.add_task(
+                "[green]Indexing tickets...", 
+                total=len(tickets)
+            )
+            
+            for ticket in tickets:
+                ticket_id = ticket.get('id', 'unknown')
+                ticket_code = ticket.get('code', 'N/A')
+                ticket_subject = ticket.get('subject', 'No subject')[:50]
+                
+                try:
+                    # Update progress description
+                    progress.update(
+                        task, 
+                        description=f"[green]Indexing[/green] │ [green]{successful} ✓[/green] [red]{failed} ✗[/red] │ #{ticket_code}: {ticket_subject}..."
+                    )
+                    
+                    # Fetch full conversation
+                    messages = liveagent_client.get_ticket_messages(ticket_id)
+                    
+                    # Format ticket as text
+                    ticket_text = liveagent_client.format_ticket_as_text(ticket, messages)
+                    
+                    # Invoke FlowHunt flow
+                    process_id = flowhunt_client.invoke_flow(
+                        flow_id=index_flow_id,
+                        human_input=ticket_text,
+                        variables={
+                            'ticket_id': ticket_id,
+                            'ticket_code': ticket_code,
+                            'department_id': ticket.get('department_id', ''),
+                            'source': 'liveagent'
+                        },
+                        singleton=False,
+                    )
+                    
+                    # Add to checkpoint data
+                    checkpoint_entry = {
+                        'ticket_id': ticket_id,
+                        'ticket_code': ticket_code,
+                        'ticket_subject': ticket.get('subject', ''),
+                        'department_id': ticket.get('department_id', ''),
+                        'department_name': ticket.get('department_name', ''),
+                        'created_at': ticket.get('date_created', ''),
+                        'status': ticket.get('status', ''),
+                        'customer_email': ticket.get('customer_email', ''),
+                        'flow_input_length': len(ticket_text),
+                        'flow_process_id': process_id,
+                        'indexed_at': datetime.now().isoformat()
+                    }
+                    checkpoint_data.append(checkpoint_entry)
+                    
+                    # Save checkpoint after each successful index
+                    df = pd.DataFrame(checkpoint_data)
+                    df.to_csv(output_path, index=False)
+                    
+                    successful += 1
+                    
+                    if verbose:
+                        console.print(f"[green]✓[/green] Indexed ticket #{ticket_code} (process: {process_id})")
+                    
+                    # Rate limiting to be nice to both APIs
+                    time.sleep(1)
+                    
+                except Exception as e:
+                    failed += 1
+                    
+                    if verbose:
+                        console.print(f"[red]✗[/red] Failed to index ticket #{ticket_code}: {str(e)}")
+                    
+                    # Still add to checkpoint with error status
+                    checkpoint_entry = {
+                        'ticket_id': ticket_id,
+                        'ticket_code': ticket_code,
+                        'ticket_subject': ticket.get('subject', ''),
+                        'department_id': ticket.get('department_id', ''),
+                        'department_name': ticket.get('department_name', ''),
+                        'created_at': ticket.get('date_created', ''),
+                        'status': ticket.get('status', ''),
+                        'customer_email': ticket.get('customer_email', ''),
+                        'flow_input_length': 0,
+                        'flow_process_id': f"ERROR: {str(e)}",
+                        'indexed_at': datetime.now().isoformat()
+                    }
+                    checkpoint_data.append(checkpoint_entry)
+                    
+                    # Save checkpoint even on errors
+                    df = pd.DataFrame(checkpoint_data)
+                    df.to_csv(output_path, index=False)
+                
+                progress.advance(task, 1)
+        
+        duration = time.time() - start_time
+        logger.progress_done("Indexing completed", duration)
+        
+        # Display summary
+        logger.stats_table("Indexing Results", {
+            "Total tickets processed": len(tickets),
+            "Successfully indexed": successful,
+            "Failed": failed,
+            "Checkpoint saved to": str(output_path)
+        })
+        
+        logger.info(f"✅ LiveAgent indexing complete! Checkpoint saved to {output_path}")
+        
+    except KeyboardInterrupt:
+        logger.error("Indexing interrupted by user")
+        if checkpoint_data:
+            df = pd.DataFrame(checkpoint_data)
+            df.to_csv(output_path, index=False)
+            logger.info(f"Partial checkpoint saved to {output_path}")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Indexing failed: {str(e)}")
+        if checkpoint_data:
+            df = pd.DataFrame(checkpoint_data)
+            df.to_csv(output_path, index=False)
+            logger.info(f"Partial checkpoint saved to {output_path}")
         sys.exit(1)
 
 

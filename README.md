@@ -14,6 +14,7 @@
 - **📈 Rich Reports**: Generate detailed evaluation reports with statistics and visualizations
 - **🔐 Authentication**: Secure API authentication management
 - **⚡ Performance**: Optimized for large-scale flow operations
+- **🔄 Data Indexing**: Index external data sources (LiveAgent, etc.) into FlowHunt
 
 ## 🚀 Quick Install
 
@@ -98,6 +99,7 @@ flowhunt batch-run your-flow-id input.csv --output-dir results/
 | `flowhunt flows list` | List all available flows |
 | `flowhunt flows inspect` | Inspect flow configuration |
 | `flowhunt batch-run` | Execute flows in batch mode |
+| `flowhunt index` | Index external data sources into FlowHunt |
 
 ## 📖 Detailed Usage
 
@@ -142,6 +144,94 @@ flowhunt batch-run FLOW_ID input.csv \
   --batch-size 5 \
   --max-workers 3
 ```
+
+## 🔄 Indexing
+
+The indexing feature allows you to import data from external sources into FlowHunt by processing them through flows.
+
+### LiveAgent Ticket Indexing
+
+Index closed/resolved support tickets from LiveAgent into FlowHunt for knowledge base creation, analysis, or training data. Only closed tickets are indexed to ensure complete conversation history.
+
+#### Basic Usage
+
+```bash
+flowhunt index liveagent <BASE_URL> <INDEX_FLOW_ID> [DEPARTMENT_ID] \
+    --api-key <LIVEAGENT_API_KEY> \
+    --limit 100 \
+    --output-csv checkpoint.csv
+```
+
+#### Parameters
+
+- **BASE_URL**: Your LiveAgent instance URL (e.g., `https://support.qualityunit.com`)
+- **INDEX_FLOW_ID**: The FlowHunt flow ID to process tickets through
+- **DEPARTMENT_ID** (optional): Filter tickets by department ID (e.g., `31ivft8h`)
+- **--api-key**: LiveAgent API key (requires read-only access to tickets)
+- **--limit**: Maximum number of tickets to index (default: 100)
+- **--output-csv**: Path to save checkpoint CSV for tracking progress
+- **--resume**: Resume indexing from a previous checkpoint file
+
+#### Examples
+
+**Index all tickets (up to 100):**
+```bash
+flowhunt index liveagent https://support.example.com flow-id-123 \
+    --api-key your-api-key \
+    --limit 100 \
+    --output-csv tickets_index.csv
+```
+
+**Index tickets from specific department:**
+```bash
+flowhunt index liveagent https://support.example.com flow-id-123 dept-456 \
+    --api-key your-api-key \
+    --limit 50 \
+    --output-csv dept_tickets.csv
+```
+
+**Resume interrupted indexing:**
+```bash
+flowhunt index liveagent https://support.example.com flow-id-123 \
+    --api-key your-api-key \
+    --resume \
+    --output-csv tickets_index.csv
+```
+
+#### Features
+
+- **📊 Progress Tracking**: Real-time progress bar with success/failure counts
+- **💾 Checkpoint System**: Automatically saves progress after each ticket
+- **🔄 Resume Capability**: Continue from where you left off if interrupted
+- **📝 CSV Export**: Tracks all indexed tickets with metadata:
+  - Ticket ID, code, and subject
+  - Department information
+  - Customer email and status
+  - Flow process ID for tracking in FlowHunt
+  - Indexing timestamp
+- **⚡ Rate Limiting**: Built-in delays to respect API limits
+- **🎯 Filtering**: Filter by department, indexes only closed tickets
+- **📧 Email Focus**: Indexes only email channel tickets
+
+#### Ticket Format
+
+Each ticket is formatted as structured text containing:
+- Ticket metadata (ID, subject, status, department, customer)
+- Full conversation history with timestamps
+- Messages clearly labeled by sender (Agent/Customer)
+
+#### CSV Checkpoint Format
+
+The checkpoint CSV contains:
+```csv
+ticket_id,ticket_code,ticket_subject,department_id,department_name,created_at,status,customer_email,flow_input_length,flow_process_id,indexed_at
+```
+
+This allows you to:
+- Track which tickets have been indexed
+- Monitor indexing success/failure
+- Resume indexing without duplicates
+- Analyze indexing metrics
 
 ## 🛠️ Development
 

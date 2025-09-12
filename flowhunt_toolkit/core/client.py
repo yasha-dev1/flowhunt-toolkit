@@ -65,7 +65,7 @@ class FlowHuntClient:
             except self.flowhunt.ApiException as e:
                 raise Exception(f"Failed to get workspace ID: {e}")
     
-    def invoke_flow(self, flow_id: str, variables: Dict[str, Any] = None, human_input: str = "") -> str:
+    def invoke_flow(self, flow_id: str, variables: Dict[str, Any] = None, human_input: str = "", singleton: bool = True) -> str:
         """Invoke a FlowHunt flow and return the process ID.
         
         Args:
@@ -86,12 +86,19 @@ class FlowHuntClient:
                     variables=variables or {},
                     human_input=human_input
                 )
-                
-                response = api_instance.invoke_flow_singleton(
-                    flow_id=flow_id,
-                    workspace_id=workspace_id,
-                    flow_invoke_request=flow_invoke_request
-                )
+
+                if singleton:
+                    response = api_instance.invoke_flow_singleton(
+                        flow_id=flow_id,
+                        workspace_id=workspace_id,
+                        flow_invoke_request=flow_invoke_request
+                    )
+                else:
+                    response = api_instance.invoke_flow(
+                        flow_id=flow_id,
+                        workspace_id=workspace_id,
+                        flow_invoke_request=flow_invoke_request
+                    )
                 
                 return response.id
                 
