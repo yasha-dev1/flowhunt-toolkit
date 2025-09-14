@@ -736,8 +736,7 @@ def auth(ctx):
 
     try:
         # Test the credentials by creating a client and making a simple API call
-        # TODO - temporarily changing to local to test memory real quick
-        client = FlowHuntClient(api_key=api_key, base_url="http://localhost:9011")
+        client = FlowHuntClient(api_key=api_key, base_url="https://api.flowhunt.io")
         
         click.echo("Testing API connection...")
         # Try to list flows to verify the credentials work
