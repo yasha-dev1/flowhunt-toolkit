@@ -944,23 +944,21 @@ def liveagent(ctx, base_url, index_flow_id, department_id, api_key, limit, outpu
                 logger.warning(f"Failed to load checkpoint: {str(e)}")
         
         # Fetch tickets from LiveAgent
-        logger.progress_start(f"Fetching tickets from LiveAgent (limit: {limit})...")
+        if resume and indexed_tickets:
+            logger.progress_start(f"Fetching tickets from LiveAgent (limit: {limit}, skipping {len(indexed_tickets)} already indexed)...")
+        else:
+            logger.progress_start(f"Fetching tickets from LiveAgent (limit: {limit})...")
+
         try:
             tickets = liveagent_client.paginate_all_tickets(
                 department_id=department_id,  # Pass department_id for filtering
-                max_tickets=limit
+                max_tickets=limit,
+                skip_ids=indexed_tickets if resume else None  # Pass already indexed IDs to skip
             )
-            logger.progress_done(f"Fetched {len(tickets)} tickets from LiveAgent")
+            logger.progress_done(f"Fetched {len(tickets)} new tickets from LiveAgent")
         except Exception as e:
             logger.error(f"Failed to fetch tickets: {str(e)}")
             sys.exit(1)
-        
-        # Filter out already indexed tickets if resuming
-        if resume and indexed_tickets:
-            original_count = len(tickets)
-            tickets = [t for t in tickets if str(t.get('id', '')) not in indexed_tickets]
-            if original_count != len(tickets):
-                logger.info(f"Skipping {original_count - len(tickets)} already indexed tickets")
         
         if not tickets:
             logger.info("No new tickets to index")

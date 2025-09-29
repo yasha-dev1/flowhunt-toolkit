@@ -39,10 +39,10 @@ class LiveAgentClient:
         url = f"{self.base_url}/api/v3/tickets"
         
         params = {
-            '_perPage': min(limit, 100),  # LiveAgent max is typically 100 per page
-            '_page': offset // min(limit, 100) + 1,
-            '_sortDir': 'DESC',
+            '_perPage': 100,  # LiveAgent max is typically 100 per page
+            '_page': (offset // 100) + 1,
             '_sortField': 'date_created',
+            '_sortDir': 'DESC',
             'status': 'R,L',  # Only Resolved/Closed tickets
             'channel': 'M'  # Email tickets only
         }
@@ -219,45 +219,57 @@ class LiveAgentClient:
         
         return '\n'.join(lines)
     
-    def paginate_all_tickets(self, department_id: Optional[str] = None, 
-                            max_tickets: Optional[int] = None) -> List[Dict[str, Any]]:
+    def paginate_all_tickets(self, department_id: Optional[str] = None,
+                            max_tickets: Optional[int] = None,
+                            skip_ids: Optional[set] = None) -> List[Dict[str, Any]]:
         """Fetch all tickets with automatic pagination.
-        
+
         Args:
             department_id: Optional department ID to filter tickets
             max_tickets: Maximum total tickets to fetch (None for all)
-            
+            skip_ids: Set of ticket IDs to skip (for resume functionality)
+
         Returns:
             List of all ticket objects
         """
         all_tickets = []
         offset = 0
         page_size = 100
-        
+        skip_ids = skip_ids or set()
+        total_fetched = 0
+
         while True:
             tickets, total = self.get_tickets(
                 department_id=department_id,  # Pass department_id for API filtering
                 limit=page_size,
                 offset=offset
             )
-            
+
             if not tickets:
                 break
-            
-            all_tickets.extend(tickets)
-            
-            # Check if we've reached the limit
+
+            # Filter out tickets we should skip
+            new_tickets = []
+            for ticket in tickets:
+                ticket_id = str(ticket.get('id', ''))
+                if ticket_id not in skip_ids:
+                    new_tickets.append(ticket)
+
+            all_tickets.extend(new_tickets)
+            total_fetched += len(tickets)
+
+            # Check if we've reached the desired number of NEW tickets
             if max_tickets and len(all_tickets) >= max_tickets:
                 all_tickets = all_tickets[:max_tickets]
                 break
-            
-            # Check if we've fetched all tickets
-            if len(all_tickets) >= total:
+
+            # If we got fewer tickets than page_size, we've reached the end of available tickets
+            if len(tickets) < page_size:
                 break
-            
+
             offset += page_size
-            
+
             # Rate limiting - be nice to the API
             time.sleep(0.5)
-        
+
         return all_tickets
