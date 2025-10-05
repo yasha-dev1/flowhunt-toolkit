@@ -16,6 +16,7 @@ from .core.evaluator import FlowEvaluator
 from .core.liveagent_client import LiveAgentClient
 from .utils.logger import Logger
 from .utils.pdf_processor import PDFProcessor
+from .utils.web_processor import WebProcessor
 import pandas as pd
 
 
@@ -1053,6 +1054,435 @@ def pdf(ctx, pdf_path, index_flow_id, max_tokens, output_csv):
         })
 
         logger.info(f"✅ PDF indexing complete! Results saved to {output_path}")
+
+    except KeyboardInterrupt:
+        logger.error("Indexing interrupted by user")
+        if results_data:
+            df = pd.DataFrame(results_data)
+            df.to_csv(output_path, index=False)
+            logger.info(f"Partial results saved to {output_path}")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Indexing failed: {str(e)}")
+        if 'results_data' in locals() and results_data:
+            df = pd.DataFrame(results_data)
+            df.to_csv(output_path, index=False)
+            logger.info(f"Partial results saved to {output_path}")
+        sys.exit(1)
+
+
+@index.command()
+@click.argument('url', type=str)
+@click.argument('index_flow_id', type=str)
+@click.option('--max-tokens', type=int, default=8000, help='Maximum tokens per chunk (default: 8000)')
+@click.option('--output-csv', type=click.Path(), help='Path to save processing results CSV')
+@click.pass_context
+def url(ctx, url, index_flow_id, max_tokens, output_csv):
+    """Index a web page by processing text chunks through a FlowHunt flow.
+
+    This command fetches content from a URL, converts it to markdown,
+    chunks it based on token count, and processes each chunk through a FlowHunt flow.
+
+    URL: The web page URL to process
+    INDEX_FLOW_ID: FlowHunt flow ID to use for processing chunks
+    """
+    verbose = ctx.obj.get('verbose', False)
+    logger = Logger(verbose=verbose)
+
+    # Generate default CSV filename if not provided
+    if not output_csv:
+        current_date = datetime.now().strftime("%Y%m%d")
+        # Create safe filename from URL
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        safe_name = parsed.netloc.replace('.', '_')
+        output_csv = f"url_index_{current_date}_{safe_name}.csv"
+
+    output_path = Path(output_csv)
+
+    # Log command start
+    config_args = {
+        'url': url,
+        'index_flow_id': index_flow_id,
+        'max_tokens': max_tokens,
+        'output_csv': str(output_path)
+    }
+    logger.command_start('index url', config_args)
+
+    start_time = time.time()
+
+    try:
+        # Initialize FlowHunt client
+        logger.progress_start("Initializing FlowHunt client...")
+        try:
+            flowhunt_client = FlowHuntClient.from_config_file()
+            logger.progress_done("FlowHunt client initialized")
+        except FileNotFoundError:
+            logger.error("No FlowHunt configuration found. Please run 'flowhunt auth' first.")
+            sys.exit(1)
+        except Exception as e:
+            logger.error(f"Failed to initialize FlowHunt client: {str(e)}")
+            sys.exit(1)
+
+        # Initialize web processor
+        logger.progress_start("Initializing web processor...")
+        try:
+            web_processor = WebProcessor(max_tokens=max_tokens)
+            logger.progress_done("Web processor initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize web processor: {str(e)}")
+            sys.exit(1)
+
+        # Fetch and chunk URL content
+        logger.progress_start(f"Fetching and processing URL: {url}...")
+        try:
+            chunks = web_processor.process_url(url, max_tokens)
+            logger.progress_done(f"URL processed into {len(chunks)} chunks")
+        except Exception as e:
+            logger.error(f"Failed to process URL: {str(e)}")
+            sys.exit(1)
+
+        if not chunks:
+            logger.info("No text chunks extracted from URL")
+            return
+
+        # Display chunk statistics
+        total_tokens = sum(token_count for _, token_count in chunks)
+        avg_tokens = total_tokens // len(chunks) if chunks else 0
+        logger.stats_table("URL Processing Summary", {
+            "Total chunks": len(chunks),
+            "Total tokens": total_tokens,
+            "Average tokens per chunk": avg_tokens,
+            "Max tokens per chunk": max_tokens
+        })
+
+        # Process chunks through FlowHunt flow
+        logger.info(f"Starting to index {len(chunks)} chunks through flow...")
+
+        successful = 0
+        failed = 0
+        results_data = []
+        console = Console()
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(complete_style="green", finished_style="bold green"),
+            TaskProgressColumn(),
+            TextColumn("•"),
+            TimeRemainingColumn(),
+            console=console,
+            transient=False
+        ) as progress:
+
+            task = progress.add_task(
+                "[green]Indexing chunks...",
+                total=len(chunks)
+            )
+
+            for chunk_idx, (chunk_text, token_count) in enumerate(chunks, 1):
+                try:
+                    # Update progress description
+                    chunk_preview = chunk_text[:50].replace('\n', ' ')
+                    progress.update(
+                        task,
+                        description=f"[green]Indexing[/green] │ [green]{successful} ✓[/green] [red]{failed} ✗[/red] │ Chunk {chunk_idx}/{len(chunks)}: {chunk_preview}..."
+                    )
+
+                    # Invoke FlowHunt flow
+                    process_id = flowhunt_client.invoke_flow(
+                        flow_id=index_flow_id,
+                        human_input=chunk_text,
+                        variables={
+                            'chunk_index': chunk_idx,
+                            'total_chunks': len(chunks),
+                            'token_count': token_count,
+                            'url': url,
+                            'source': 'url'
+                        },
+                        singleton=False,
+                    )
+
+                    # Add to results data
+                    results_data.append({
+                        'chunk_index': chunk_idx,
+                        'token_count': token_count,
+                        'chunk_preview': chunk_text[:100].replace('\n', ' '),
+                        'flow_process_id': process_id,
+                        'status': 'success',
+                        'indexed_at': datetime.now().isoformat()
+                    })
+
+                    successful += 1
+
+                    if verbose:
+                        console.print(f"[green]✓[/green] Indexed chunk {chunk_idx}/{len(chunks)} ({token_count} tokens, process: {process_id})")
+
+                    # Rate limiting to be nice to the API
+                    time.sleep(0.5)
+
+                except Exception as e:
+                    failed += 1
+
+                    if verbose:
+                        console.print(f"[red]✗[/red] Failed to index chunk {chunk_idx}/{len(chunks)}: {str(e)}")
+
+                    # Still add to results with error status
+                    results_data.append({
+                        'chunk_index': chunk_idx,
+                        'token_count': token_count,
+                        'chunk_preview': chunk_text[:100].replace('\n', ' '),
+                        'flow_process_id': f"ERROR: {str(e)}",
+                        'status': 'failed',
+                        'indexed_at': datetime.now().isoformat()
+                    })
+
+                progress.advance(task, 1)
+
+        # Save results to CSV
+        if results_data:
+            logger.progress_start(f"Saving results to {output_csv}...")
+            try:
+                df = pd.DataFrame(results_data)
+                df.to_csv(output_path, index=False)
+                logger.progress_done(f"Results saved to {output_csv}")
+            except Exception as e:
+                logger.warning(f"Failed to save results: {str(e)}")
+
+        duration = time.time() - start_time
+        logger.progress_done("URL indexing completed", duration)
+
+        # Display summary
+        logger.stats_table("Indexing Results", {
+            "Total chunks": len(chunks),
+            "Successfully indexed": successful,
+            "Failed": failed,
+            "Results saved to": str(output_path)
+        })
+
+        logger.info(f"✅ URL indexing complete! Results saved to {output_path}")
+
+    except KeyboardInterrupt:
+        logger.error("Indexing interrupted by user")
+        if results_data:
+            df = pd.DataFrame(results_data)
+            df.to_csv(output_path, index=False)
+            logger.info(f"Partial results saved to {output_path}")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Indexing failed: {str(e)}")
+        if 'results_data' in locals() and results_data:
+            df = pd.DataFrame(results_data)
+            df.to_csv(output_path, index=False)
+            logger.info(f"Partial results saved to {output_path}")
+        sys.exit(1)
+
+
+@index.command()
+@click.argument('sitemap_url', type=str)
+@click.argument('index_flow_id', type=str)
+@click.option('--max-tokens', type=int, default=8000, help='Maximum tokens per chunk (default: 8000)')
+@click.option('--limit', type=int, help='Maximum number of URLs to process from sitemap')
+@click.option('--output-csv', type=click.Path(), help='Path to save processing results CSV')
+@click.pass_context
+def sitemap(ctx, sitemap_url, index_flow_id, max_tokens, limit, output_csv):
+    """Index all URLs from a sitemap by processing through a FlowHunt flow.
+
+    This command fetches all URLs from a sitemap.xml, processes each page's content,
+    chunks it based on token count, and processes each chunk through a FlowHunt flow.
+
+    SITEMAP_URL: URL of the sitemap.xml file
+    INDEX_FLOW_ID: FlowHunt flow ID to use for processing chunks
+    """
+    verbose = ctx.obj.get('verbose', False)
+    logger = Logger(verbose=verbose)
+
+    # Generate default CSV filename if not provided
+    if not output_csv:
+        current_date = datetime.now().strftime("%Y%m%d")
+        from urllib.parse import urlparse
+        parsed = urlparse(sitemap_url)
+        safe_name = parsed.netloc.replace('.', '_')
+        output_csv = f"sitemap_index_{current_date}_{safe_name}.csv"
+
+    output_path = Path(output_csv)
+
+    # Log command start
+    config_args = {
+        'sitemap_url': sitemap_url,
+        'index_flow_id': index_flow_id,
+        'max_tokens': max_tokens,
+        'limit': limit or 'No limit',
+        'output_csv': str(output_path)
+    }
+    logger.command_start('index sitemap', config_args)
+
+    start_time = time.time()
+
+    try:
+        # Initialize FlowHunt client
+        logger.progress_start("Initializing FlowHunt client...")
+        try:
+            flowhunt_client = FlowHuntClient.from_config_file()
+            logger.progress_done("FlowHunt client initialized")
+        except FileNotFoundError:
+            logger.error("No FlowHunt configuration found. Please run 'flowhunt auth' first.")
+            sys.exit(1)
+        except Exception as e:
+            logger.error(f"Failed to initialize FlowHunt client: {str(e)}")
+            sys.exit(1)
+
+        # Initialize web processor
+        logger.progress_start("Initializing web processor...")
+        try:
+            web_processor = WebProcessor(max_tokens=max_tokens)
+            logger.progress_done("Web processor initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize web processor: {str(e)}")
+            sys.exit(1)
+
+        # Parse sitemap
+        logger.progress_start(f"Parsing sitemap: {sitemap_url}...")
+        try:
+            urls = web_processor.parse_sitemap(sitemap_url)
+            if limit:
+                urls = urls[:limit]
+            logger.progress_done(f"Found {len(urls)} URLs in sitemap")
+        except Exception as e:
+            logger.error(f"Failed to parse sitemap: {str(e)}")
+            sys.exit(1)
+
+        if not urls:
+            logger.info("No URLs found in sitemap")
+            return
+
+        logger.info(f"Starting to process {len(urls)} URLs from sitemap...")
+
+        successful_urls = 0
+        failed_urls = 0
+        total_chunks = 0
+        results_data = []
+        console = Console()
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(complete_style="green", finished_style="bold green"),
+            TaskProgressColumn(),
+            TextColumn("•"),
+            TimeRemainingColumn(),
+            console=console,
+            transient=False
+        ) as progress:
+
+            task = progress.add_task(
+                "[green]Processing URLs...",
+                total=len(urls)
+            )
+
+            for url_idx, page_url in enumerate(urls, 1):
+                try:
+                    # Update progress
+                    progress.update(
+                        task,
+                        description=f"[green]Processing[/green] │ [green]{successful_urls} ✓[/green] [red]{failed_urls} ✗[/red] │ URL {url_idx}/{len(urls)}: {page_url[:40]}..."
+                    )
+
+                    # Fetch and chunk URL content
+                    chunks = web_processor.process_url(page_url, max_tokens)
+
+                    # Process each chunk
+                    for chunk_idx, (chunk_text, token_count) in enumerate(chunks, 1):
+                        try:
+                            # Invoke FlowHunt flow
+                            process_id = flowhunt_client.invoke_flow(
+                                flow_id=index_flow_id,
+                                human_input=chunk_text,
+                                variables={
+                                    'url_index': url_idx,
+                                    'total_urls': len(urls),
+                                    'chunk_index': chunk_idx,
+                                    'total_chunks': len(chunks),
+                                    'token_count': token_count,
+                                    'url': page_url,
+                                    'source': 'sitemap'
+                                },
+                                singleton=False,
+                            )
+
+                            # Add to results data
+                            results_data.append({
+                                'url_index': url_idx,
+                                'url': page_url,
+                                'chunk_index': chunk_idx,
+                                'token_count': token_count,
+                                'chunk_preview': chunk_text[:100].replace('\n', ' '),
+                                'flow_process_id': process_id,
+                                'status': 'success',
+                                'indexed_at': datetime.now().isoformat()
+                            })
+
+                            total_chunks += 1
+
+                            if verbose:
+                                console.print(f"[green]✓[/green] Indexed {page_url} chunk {chunk_idx}/{len(chunks)} ({token_count} tokens)")
+
+                            # Rate limiting
+                            time.sleep(0.5)
+
+                        except Exception as e:
+                            if verbose:
+                                console.print(f"[red]✗[/red] Failed to index chunk {chunk_idx} from {page_url}: {str(e)}")
+
+                            results_data.append({
+                                'url_index': url_idx,
+                                'url': page_url,
+                                'chunk_index': chunk_idx,
+                                'token_count': token_count,
+                                'chunk_preview': chunk_text[:100].replace('\n', ' '),
+                                'flow_process_id': f"ERROR: {str(e)}",
+                                'status': 'failed',
+                                'indexed_at': datetime.now().isoformat()
+                            })
+
+                    successful_urls += 1
+
+                except Exception as e:
+                    failed_urls += 1
+                    if verbose:
+                        console.print(f"[red]✗[/red] Failed to process URL {page_url}: {str(e)}")
+
+                    results_data.append({
+                        'url_index': url_idx,
+                        'url': page_url,
+                        'chunk_index': 0,
+                        'token_count': 0,
+                        'chunk_preview': '',
+                        'flow_process_id': f"ERROR: {str(e)}",
+                        'status': 'failed',
+                        'indexed_at': datetime.now().isoformat()
+                    })
+
+                progress.advance(task, 1)
+
+                # Save checkpoint after each URL
+                if results_data:
+                    df = pd.DataFrame(results_data)
+                    df.to_csv(output_path, index=False)
+
+        duration = time.time() - start_time
+        logger.progress_done("Sitemap indexing completed", duration)
+
+        # Display summary
+        logger.stats_table("Indexing Results", {
+            "Total URLs": len(urls),
+            "Successfully processed URLs": successful_urls,
+            "Failed URLs": failed_urls,
+            "Total chunks indexed": total_chunks,
+            "Results saved to": str(output_path)
+        })
+
+        logger.info(f"✅ Sitemap indexing complete! Results saved to {output_path}")
 
     except KeyboardInterrupt:
         logger.error("Indexing interrupted by user")

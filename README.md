@@ -14,7 +14,7 @@
 - **📈 Rich Reports**: Generate detailed evaluation reports with statistics and visualizations
 - **🔐 Authentication**: Secure API authentication management
 - **⚡ Performance**: Optimized for large-scale flow operations
-- **🔄 Data Indexing**: Index external data sources (LiveAgent, PDFs, etc.) into FlowHunt
+- **🔄 Data Indexing**: Index external data sources (LiveAgent, PDFs, URLs, sitemaps) into FlowHunt
 
 ## 🚀 Quick Install
 
@@ -219,6 +219,138 @@ This allows you to:
 - Track which chunks have been processed
 - Monitor processing success/failure
 - Verify token counts per chunk
+- Link back to FlowHunt processes
+
+### URL Indexing
+
+Index individual web pages by extracting content, chunking it based on token count, and processing each chunk through a FlowHunt flow. HTML is converted to markdown for better formatting.
+
+#### Basic Usage
+
+```bash
+flowhunt index url <URL> <INDEX_FLOW_ID> \
+    --max-tokens 8000 \
+    --output-csv results.csv
+```
+
+#### Parameters
+
+- **URL**: The web page URL to process
+- **INDEX_FLOW_ID**: The FlowHunt flow ID to process text chunks through
+- **--max-tokens**: Maximum tokens per chunk (default: 8000)
+- **--output-csv**: Path to save processing results CSV (auto-generated if not specified)
+
+#### Examples
+
+**Index a single URL with default settings:**
+```bash
+flowhunt index url https://example.com/article flow-id-123
+```
+
+**Index with custom token limit:**
+```bash
+flowhunt index url https://example.com/docs flow-id-123 --max-tokens 4000
+```
+
+**Specify output location:**
+```bash
+flowhunt index url https://example.com/page flow-id-123 --output-csv my_results.csv
+```
+
+#### Features
+
+- **🌐 Web Content Extraction**: Fetches and extracts content from any URL
+- **📝 HTML to Markdown**: Converts HTML to clean markdown format
+- **🔢 Token Counting**: Uses tiktoken (cl100k_base encoding) for accurate token counting
+- **✂️ Smart Chunking**: Intelligently splits text by paragraphs and sentences
+- **📊 Progress Tracking**: Real-time progress bar with success/failure counts
+- **📝 CSV Export**: Tracks all processed chunks with metadata
+- **⚡ Rate Limiting**: Built-in delays to respect API limits
+
+#### Flow Variables
+
+Each chunk is processed with the following variables:
+- `chunk_index`: Current chunk number (1-based)
+- `total_chunks`: Total number of chunks
+- `token_count`: Number of tokens in this chunk
+- `url`: The source URL
+- `source`: Always set to "url"
+
+### Sitemap Indexing
+
+Index all URLs from a sitemap.xml by processing each page's content through a FlowHunt flow. Supports both regular sitemaps and sitemap index files.
+
+#### Basic Usage
+
+```bash
+flowhunt index sitemap <SITEMAP_URL> <INDEX_FLOW_ID> \
+    --max-tokens 8000 \
+    --limit 100 \
+    --output-csv results.csv
+```
+
+#### Parameters
+
+- **SITEMAP_URL**: URL of the sitemap.xml file
+- **INDEX_FLOW_ID**: The FlowHunt flow ID to process text chunks through
+- **--max-tokens**: Maximum tokens per chunk (default: 8000)
+- **--limit**: Maximum number of URLs to process from sitemap (optional)
+- **--output-csv**: Path to save processing results CSV (auto-generated if not specified)
+
+#### Examples
+
+**Index entire sitemap:**
+```bash
+flowhunt index sitemap https://example.com/sitemap.xml flow-id-123
+```
+
+**Index with URL limit:**
+```bash
+flowhunt index sitemap https://example.com/sitemap.xml flow-id-123 --limit 50
+```
+
+**Custom token limit and output:**
+```bash
+flowhunt index sitemap https://example.com/sitemap.xml flow-id-123 \
+    --max-tokens 4000 \
+    --output-csv sitemap_results.csv
+```
+
+#### Features
+
+- **🗺️ Sitemap Parsing**: Automatically parses sitemap.xml files
+- **📑 Sitemap Index Support**: Recursively processes sitemap index files
+- **🌐 Multi-URL Processing**: Processes all URLs found in the sitemap
+- **📝 HTML to Markdown**: Converts each page's HTML to markdown
+- **🔢 Token Counting**: Uses tiktoken for accurate token counting
+- **✂️ Smart Chunking**: Intelligently splits text by paragraphs and sentences
+- **📊 Progress Tracking**: Real-time progress bar showing URL and chunk progress
+- **💾 Checkpoint System**: Saves progress after each URL
+- **📝 CSV Export**: Tracks all processed chunks with URL and chunk metadata
+- **⚡ Rate Limiting**: Built-in delays to respect API limits
+
+#### Flow Variables
+
+Each chunk is processed with the following variables:
+- `url_index`: Current URL number (1-based)
+- `total_urls`: Total number of URLs in sitemap
+- `chunk_index`: Current chunk number within the URL (1-based)
+- `total_chunks`: Total chunks for this URL
+- `token_count`: Number of tokens in this chunk
+- `url`: The source URL
+- `source`: Always set to "sitemap"
+
+#### CSV Output Format
+
+The results CSV contains:
+```csv
+url_index,url,chunk_index,token_count,chunk_preview,flow_process_id,status,indexed_at
+```
+
+This allows you to:
+- Track which URLs and chunks have been processed
+- Monitor processing success/failure per URL and chunk
+- Resume processing if interrupted
 - Link back to FlowHunt processes
 
 ### LiveAgent Ticket Indexing
