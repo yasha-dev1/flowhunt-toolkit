@@ -15,6 +15,7 @@ from .core.client import FlowHuntClient
 from .core.evaluator import FlowEvaluator
 from .core.liveagent_client import LiveAgentClient
 from .utils.logger import Logger
+from .utils.pdf_processor import PDFProcessor
 import pandas as pd
 
 
@@ -862,6 +863,211 @@ def index(ctx):
     external sources by processing them through FlowHunt flows.
     """
     pass
+
+
+@index.command()
+@click.argument('pdf_path', type=click.Path(exists=True))
+@click.argument('index_flow_id', type=str)
+@click.option('--max-tokens', type=int, default=8000, help='Maximum tokens per chunk (default: 8000)')
+@click.option('--output-csv', type=click.Path(), help='Path to save processing results CSV')
+@click.pass_context
+def pdf(ctx, pdf_path, index_flow_id, max_tokens, output_csv):
+    """Index a PDF file by processing text chunks through a FlowHunt flow.
+
+    This command extracts text from a PDF file, chunks it based on token count,
+    and processes each chunk through a FlowHunt flow for indexing.
+
+    PDF_PATH: Path to the PDF file to process
+    INDEX_FLOW_ID: FlowHunt flow ID to use for processing chunks
+    """
+    verbose = ctx.obj.get('verbose', False)
+    logger = Logger(verbose=verbose)
+
+    pdf_file = Path(pdf_path)
+
+    # Generate default CSV filename if not provided
+    if not output_csv:
+        current_date = datetime.now().strftime("%Y%m%d")
+        output_csv = f"pdf_index_{current_date}_{pdf_file.stem}.csv"
+
+    output_path = Path(output_csv)
+
+    # Log command start
+    config_args = {
+        'pdf_path': str(pdf_file),
+        'index_flow_id': index_flow_id,
+        'max_tokens': max_tokens,
+        'output_csv': str(output_path)
+    }
+    logger.command_start('index pdf', config_args)
+
+    start_time = time.time()
+
+    try:
+        # Initialize FlowHunt client
+        logger.progress_start("Initializing FlowHunt client...")
+        try:
+            flowhunt_client = FlowHuntClient.from_config_file()
+            logger.progress_done("FlowHunt client initialized")
+        except FileNotFoundError:
+            logger.error("No FlowHunt configuration found. Please run 'flowhunt auth' first.")
+            sys.exit(1)
+        except Exception as e:
+            logger.error(f"Failed to initialize FlowHunt client: {str(e)}")
+            sys.exit(1)
+
+        # Initialize PDF processor
+        logger.progress_start("Initializing PDF processor...")
+        try:
+            pdf_processor = PDFProcessor(max_tokens=max_tokens)
+            logger.progress_done("PDF processor initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize PDF processor: {str(e)}")
+            sys.exit(1)
+
+        # Extract and chunk PDF text
+        logger.progress_start(f"Processing PDF: {pdf_file.name}...")
+        try:
+            chunks = pdf_processor.process_pdf(pdf_file, max_tokens)
+            logger.progress_done(f"PDF processed into {len(chunks)} chunks")
+        except Exception as e:
+            logger.error(f"Failed to process PDF: {str(e)}")
+            sys.exit(1)
+
+        if not chunks:
+            logger.info("No text chunks extracted from PDF")
+            return
+
+        # Display chunk statistics
+        total_tokens = sum(token_count for _, token_count in chunks)
+        avg_tokens = total_tokens // len(chunks) if chunks else 0
+        logger.stats_table("PDF Processing Summary", {
+            "Total chunks": len(chunks),
+            "Total tokens": total_tokens,
+            "Average tokens per chunk": avg_tokens,
+            "Max tokens per chunk": max_tokens
+        })
+
+        # Process chunks through FlowHunt flow
+        logger.info(f"Starting to index {len(chunks)} chunks through flow...")
+
+        successful = 0
+        failed = 0
+        results_data = []
+        console = Console()
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(complete_style="green", finished_style="bold green"),
+            TaskProgressColumn(),
+            TextColumn("•"),
+            TimeRemainingColumn(),
+            console=console,
+            transient=False
+        ) as progress:
+
+            task = progress.add_task(
+                "[green]Indexing chunks...",
+                total=len(chunks)
+            )
+
+            for chunk_idx, (chunk_text, token_count) in enumerate(chunks, 1):
+                try:
+                    # Update progress description
+                    chunk_preview = chunk_text[:50].replace('\n', ' ')
+                    progress.update(
+                        task,
+                        description=f"[green]Indexing[/green] │ [green]{successful} ✓[/green] [red]{failed} ✗[/red] │ Chunk {chunk_idx}/{len(chunks)}: {chunk_preview}..."
+                    )
+
+                    # Invoke FlowHunt flow
+                    process_id = flowhunt_client.invoke_flow(
+                        flow_id=index_flow_id,
+                        human_input=chunk_text,
+                        variables={
+                            'chunk_index': chunk_idx,
+                            'total_chunks': len(chunks),
+                            'token_count': token_count,
+                            'pdf_filename': pdf_file.name,
+                            'source': 'pdf'
+                        },
+                        singleton=False,
+                    )
+
+                    # Add to results data
+                    results_data.append({
+                        'chunk_index': chunk_idx,
+                        'token_count': token_count,
+                        'chunk_preview': chunk_text[:100].replace('\n', ' '),
+                        'flow_process_id': process_id,
+                        'status': 'success',
+                        'indexed_at': datetime.now().isoformat()
+                    })
+
+                    successful += 1
+
+                    if verbose:
+                        console.print(f"[green]✓[/green] Indexed chunk {chunk_idx}/{len(chunks)} ({token_count} tokens, process: {process_id})")
+
+                    # Rate limiting to be nice to the API
+                    time.sleep(0.5)
+
+                except Exception as e:
+                    failed += 1
+
+                    if verbose:
+                        console.print(f"[red]✗[/red] Failed to index chunk {chunk_idx}/{len(chunks)}: {str(e)}")
+
+                    # Still add to results with error status
+                    results_data.append({
+                        'chunk_index': chunk_idx,
+                        'token_count': token_count,
+                        'chunk_preview': chunk_text[:100].replace('\n', ' '),
+                        'flow_process_id': f"ERROR: {str(e)}",
+                        'status': 'failed',
+                        'indexed_at': datetime.now().isoformat()
+                    })
+
+                progress.advance(task, 1)
+
+        # Save results to CSV
+        if results_data:
+            logger.progress_start(f"Saving results to {output_csv}...")
+            try:
+                df = pd.DataFrame(results_data)
+                df.to_csv(output_path, index=False)
+                logger.progress_done(f"Results saved to {output_csv}")
+            except Exception as e:
+                logger.warning(f"Failed to save results: {str(e)}")
+
+        duration = time.time() - start_time
+        logger.progress_done("PDF indexing completed", duration)
+
+        # Display summary
+        logger.stats_table("Indexing Results", {
+            "Total chunks": len(chunks),
+            "Successfully indexed": successful,
+            "Failed": failed,
+            "Results saved to": str(output_path)
+        })
+
+        logger.info(f"✅ PDF indexing complete! Results saved to {output_path}")
+
+    except KeyboardInterrupt:
+        logger.error("Indexing interrupted by user")
+        if results_data:
+            df = pd.DataFrame(results_data)
+            df.to_csv(output_path, index=False)
+            logger.info(f"Partial results saved to {output_path}")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Indexing failed: {str(e)}")
+        if 'results_data' in locals() and results_data:
+            df = pd.DataFrame(results_data)
+            df.to_csv(output_path, index=False)
+            logger.info(f"Partial results saved to {output_path}")
+        sys.exit(1)
 
 
 @index.command()

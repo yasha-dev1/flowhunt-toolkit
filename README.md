@@ -14,7 +14,7 @@
 - **📈 Rich Reports**: Generate detailed evaluation reports with statistics and visualizations
 - **🔐 Authentication**: Secure API authentication management
 - **⚡ Performance**: Optimized for large-scale flow operations
-- **🔄 Data Indexing**: Index external data sources (LiveAgent, etc.) into FlowHunt
+- **🔄 Data Indexing**: Index external data sources (LiveAgent, PDFs, etc.) into FlowHunt
 
 ## 🚀 Quick Install
 
@@ -148,6 +148,78 @@ flowhunt batch-run FLOW_ID input.csv \
 ## 🔄 Indexing
 
 The indexing feature allows you to import data from external sources into FlowHunt by processing them through flows.
+
+### PDF Document Indexing
+
+Index PDF documents by extracting text, chunking it based on token count, and processing each chunk through a FlowHunt flow. Uses tiktoken for accurate token counting.
+
+#### Basic Usage
+
+```bash
+flowhunt index pdf <PDF_PATH> <INDEX_FLOW_ID> \
+    --max-tokens 8000 \
+    --output-csv results.csv
+```
+
+#### Parameters
+
+- **PDF_PATH**: Path to the PDF file to process
+- **INDEX_FLOW_ID**: The FlowHunt flow ID to process text chunks through
+- **--max-tokens**: Maximum tokens per chunk (default: 8000)
+- **--output-csv**: Path to save processing results CSV (auto-generated if not specified)
+
+#### Examples
+
+**Index a PDF with default 8k token chunks:**
+```bash
+flowhunt index pdf document.pdf flow-id-123
+```
+
+**Index with custom token limit:**
+```bash
+flowhunt index pdf document.pdf flow-id-123 --max-tokens 4000
+```
+
+**Specify output location:**
+```bash
+flowhunt index pdf document.pdf flow-id-123 --output-csv my_results.csv
+```
+
+#### Features
+
+- **📄 PDF Text Extraction**: Extracts text from all pages using pypdf
+- **🔢 Token Counting**: Uses tiktoken (cl100k_base encoding) for accurate GPT-4/ChatGPT token counting
+- **✂️ Smart Chunking**: Intelligently splits text by paragraphs and sentences to respect token limits
+- **📊 Progress Tracking**: Real-time progress bar with success/failure counts
+- **📝 CSV Export**: Tracks all processed chunks with metadata:
+  - Chunk index and token count
+  - Text preview
+  - Flow process ID for tracking in FlowHunt
+  - Processing timestamp and status
+- **⚡ Rate Limiting**: Built-in delays to respect API limits
+- **🔄 Error Handling**: Continues processing on errors, saves partial results
+
+#### Flow Variables
+
+Each chunk is processed with the following variables available in your flow:
+- `chunk_index`: Current chunk number (1-based)
+- `total_chunks`: Total number of chunks
+- `token_count`: Number of tokens in this chunk
+- `pdf_filename`: Original PDF filename
+- `source`: Always set to "pdf"
+
+#### CSV Output Format
+
+The results CSV contains:
+```csv
+chunk_index,token_count,chunk_preview,flow_process_id,status,indexed_at
+```
+
+This allows you to:
+- Track which chunks have been processed
+- Monitor processing success/failure
+- Verify token counts per chunk
+- Link back to FlowHunt processes
 
 ### LiveAgent Ticket Indexing
 
