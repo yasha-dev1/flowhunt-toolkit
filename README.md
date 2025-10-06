@@ -14,7 +14,7 @@
 - **📈 Rich Reports**: Generate detailed evaluation reports with statistics and visualizations
 - **🔐 Authentication**: Secure API authentication management
 - **⚡ Performance**: Optimized for large-scale flow operations
-- **🔄 Data Indexing**: Index external data sources (LiveAgent, PDFs, URLs, sitemaps) into FlowHunt
+- **🔄 Data Indexing**: Index external data sources (LiveAgent, PDFs, DOCX, URLs, sitemaps, folders) into FlowHunt
 
 ## 🚀 Quick Install
 
@@ -350,6 +350,154 @@ url_index,url,chunk_index,token_count,chunk_preview,flow_process_id,status,index
 This allows you to:
 - Track which URLs and chunks have been processed
 - Monitor processing success/failure per URL and chunk
+- Resume processing if interrupted
+- Link back to FlowHunt processes
+
+### DOCX Document Indexing
+
+Index DOCX documents by extracting text, chunking it based on token count, and processing each chunk through a FlowHunt flow. Uses tiktoken for accurate token counting.
+
+#### Basic Usage
+
+```bash
+flowhunt index docx <DOCX_PATH> <INDEX_FLOW_ID> \
+    --max-tokens 8000 \
+    --output-csv results.csv
+```
+
+#### Parameters
+
+- **DOCX_PATH**: Path to the DOCX file to process
+- **INDEX_FLOW_ID**: The FlowHunt flow ID to process text chunks through
+- **--max-tokens**: Maximum tokens per chunk (default: 8000)
+- **--output-csv**: Path to save processing results CSV (auto-generated if not specified)
+
+#### Examples
+
+**Index a DOCX with default 8k token chunks:**
+```bash
+flowhunt index docx document.docx flow-id-123
+```
+
+**Index with custom token limit:**
+```bash
+flowhunt index docx document.docx flow-id-123 --max-tokens 4000
+```
+
+**Specify output location:**
+```bash
+flowhunt index docx document.docx flow-id-123 --output-csv my_results.csv
+```
+
+#### Features
+
+- **📄 DOCX Text Extraction**: Extracts text from all paragraphs using python-docx
+- **🔢 Token Counting**: Uses tiktoken (cl100k_base encoding) for accurate GPT-4/ChatGPT token counting
+- **✂️ Smart Chunking**: Intelligently splits text by paragraphs and sentences to respect token limits
+- **📊 Progress Tracking**: Real-time progress bar with success/failure counts
+- **📝 CSV Export**: Tracks all processed chunks with metadata:
+  - Chunk index and token count
+  - Text preview
+  - Flow process ID for tracking in FlowHunt
+  - Processing timestamp and status
+- **⚡ Rate Limiting**: Built-in delays to respect API limits
+- **🔄 Error Handling**: Continues processing on errors, saves partial results
+
+#### Flow Variables
+
+Each chunk is processed with the following variables available in your flow:
+- `chunk_index`: Current chunk number (1-based)
+- `total_chunks`: Total number of chunks
+- `token_count`: Number of tokens in this chunk
+- `docx_filename`: Original DOCX filename
+- `source`: Always set to "docx"
+
+#### CSV Output Format
+
+The results CSV contains:
+```csv
+chunk_index,token_count,chunk_preview,flow_process_id,status,indexed_at
+```
+
+This allows you to:
+- Track which chunks have been processed
+- Monitor processing success/failure
+- Verify token counts per chunk
+- Link back to FlowHunt processes
+
+### Folder Indexing
+
+Index all PDF and DOCX files in a folder by automatically detecting file types, extracting text, chunking it, and processing each chunk through a FlowHunt flow. Perfect for batch processing document collections.
+
+#### Basic Usage
+
+```bash
+flowhunt index folder <FOLDER_PATH> <INDEX_FLOW_ID> \
+    --max-tokens 8000 \
+    --output-csv results.csv
+```
+
+#### Parameters
+
+- **FOLDER_PATH**: Path to the folder containing PDF and/or DOCX files
+- **INDEX_FLOW_ID**: The FlowHunt flow ID to process text chunks through
+- **--max-tokens**: Maximum tokens per chunk (default: 8000)
+- **--output-csv**: Path to save processing results CSV (auto-generated if not specified)
+
+#### Examples
+
+**Index all documents in a folder:**
+```bash
+flowhunt index folder ./documents flow-id-123
+```
+
+**Index with custom token limit:**
+```bash
+flowhunt index folder ./documents flow-id-123 --max-tokens 4000
+```
+
+**Specify output location:**
+```bash
+flowhunt index folder ./documents flow-id-123 --output-csv folder_results.csv
+```
+
+#### Features
+
+- **🔍 Auto-Detection**: Automatically finds and processes PDF and DOCX files
+- **📂 Multi-Format Support**: Handles both PDF and DOCX files in the same folder
+- **🗑️ Smart Filtering**: Filters out temporary Word files (starting with ~$)
+- **📄 Text Extraction**: Uses specialized processors for each file type
+- **🔢 Token Counting**: Uses tiktoken for accurate token counting
+- **✂️ Smart Chunking**: Intelligently splits text by paragraphs and sentences
+- **📊 Progress Tracking**: Real-time progress bar showing file and chunk progress
+- **💾 Checkpoint System**: Saves progress after each file
+- **📝 CSV Export**: Tracks all processed chunks with file and chunk metadata
+- **⚡ Rate Limiting**: Built-in delays to respect API limits
+- **🔄 Error Handling**: Continues processing on errors, saves partial results
+
+#### Flow Variables
+
+Each chunk is processed with the following variables:
+- `file_index`: Current file number (1-based)
+- `total_files`: Total number of files in folder
+- `chunk_index`: Current chunk number within the file (1-based)
+- `total_chunks`: Total chunks for this file
+- `token_count`: Number of tokens in this chunk
+- `filename`: Original filename
+- `file_type`: File type ("pdf" or "docx")
+- `source`: Always set to "folder"
+
+#### CSV Output Format
+
+The results CSV contains:
+```csv
+file_index,filename,file_type,chunk_index,token_count,chunk_preview,flow_process_id,status,indexed_at
+```
+
+This allows you to:
+- Track which files and chunks have been processed
+- Monitor processing success/failure per file and chunk
+- See file type breakdown (PDF vs DOCX)
 - Resume processing if interrupted
 - Link back to FlowHunt processes
 
