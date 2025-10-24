@@ -147,7 +147,7 @@ FlowHunt Toolkit provides two powerful batch processing modes for different use 
 Process multiple inputs from a CSV file where each row is a separate flow execution:
 
 ```bash
-flowhunt batch-run FLOW_ID input.csv \
+flowhunt batch-run input.csv FLOW_ID \
   --output-dir results/ \
   --max-parallel 50 \
   --check-interval 2
