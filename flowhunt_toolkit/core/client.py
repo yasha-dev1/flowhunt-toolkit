@@ -596,13 +596,289 @@ class FlowHuntClient:
         """Save content to file."""
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
-        
+
         file_path = output_path / filename
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         with open(file_path, 'w', encoding='utf-8') as f:
             f.write(content)
-    
+
+    def batch_execute_matrix_from_csv(self, csv_file: str, flow_id: str, output_file: str,
+                                      col_variable_name: str = "col_name", check_interval: int = 2,
+                                      max_parallel: int = 50) -> Dict[str, Any]:
+        """Execute a flow for each cell in a CSV matrix.
+
+        Args:
+            csv_file: Path to CSV file
+            flow_id: FlowHunt flow ID to execute
+            output_file: Path to save output CSV
+            col_variable_name: Variable name for column headers (default: "col_name")
+            check_interval: Seconds between result checks (default: 2)
+            max_parallel: Maximum number of tasks to schedule in parallel (default: 50)
+
+        Returns:
+            Dictionary with execution statistics
+        """
+        import pandas as pd
+
+        # Read CSV file
+        try:
+            df = pd.read_csv(csv_file)
+        except Exception as e:
+            raise Exception(f"Failed to read CSV file: {e}")
+
+        if df.empty:
+            raise ValueError("CSV file is empty")
+
+        # Validate CSV has at least 2 columns (first column = input, rest = processing columns)
+        if len(df.columns) < 2:
+            raise ValueError("CSV must have at least 2 columns (first column is input source, rest are processing columns)")
+
+        # Create output dataframe with same structure
+        output_df = pd.DataFrame(columns=df.columns, index=df.index)
+
+        # Get first column name (input source column)
+        first_col = df.columns[0]
+
+        # Copy first column to output as-is
+        output_df[first_col] = df[first_col]
+
+        # Build list of cell tasks (row_idx, col_name, flow_input)
+        # First column values become flow_input for all other columns in that row
+        cell_tasks = []
+        for row_idx in range(len(df)):
+            # Get the input value from first column
+            input_value = df.iloc[row_idx][first_col]
+
+            # Skip row if first column is empty
+            if pd.isna(input_value) or str(input_value).strip() == '':
+                # Keep all cells in this row empty
+                for col_name in df.columns[1:]:
+                    output_df.loc[row_idx, col_name] = ''
+                continue
+
+            input_value_str = str(input_value).strip()
+
+            # Process remaining columns (skip first column)
+            for col_name in df.columns[1:]:
+                cell_tasks.append({
+                    'row_idx': row_idx,
+                    'col_name': col_name,
+                    'flow_input': input_value_str
+                })
+
+        if not cell_tasks:
+            # All cells were empty, just save the input as output
+            output_df.to_csv(output_file, index=False)
+            return {"completed": 0, "failed": 0, "skipped": len(df) * len(df.columns), "total": len(df) * len(df.columns)}
+
+        # Execute batch processing for all cells
+        stats = self._process_matrix_cells(cell_tasks, flow_id, output_df, col_variable_name,
+                                           check_interval, max_parallel)
+
+        # Save output CSV
+        try:
+            output_df.to_csv(output_file, index=False)
+        except Exception as e:
+            raise Exception(f"Failed to save output CSV: {e}")
+
+        return stats
+
+    def _process_matrix_cells(self, cell_tasks: List[Dict[str, Any]], flow_id: str,
+                             output_df, col_variable_name: str, check_interval: int,
+                             max_parallel: int) -> Dict[str, Any]:
+        """Process cell tasks in batch with controlled parallelism."""
+        workspace_id = self.get_workspace_id()
+        console = Console()
+
+        with self.flowhunt.ApiClient(self.configuration) as api_client:
+            api_instance = self.flowhunt.FlowsApi(api_client)
+
+            # Track tasks
+            pending_tasks = {}  # process_id -> cell_task
+            completed_count = 0
+            failed_count = 0
+            tasks_queue = cell_tasks.copy()
+
+            # Create header panel
+            header_panel = Panel(
+                f"[bold cyan]🔢 CSV MATRIX BATCH EXECUTION[/bold cyan]\n"
+                f"[dim]Processing {len(cell_tasks)} cells with max {max_parallel} parallel workers[/dim]\n"
+                f"[dim]Flow ID: {flow_id[:8]}...{flow_id[-8:] if len(flow_id) > 16 else flow_id}[/dim]",
+                box=box.ROUNDED,
+                border_style="cyan"
+            )
+            console.print(header_panel)
+
+            # Create progress display
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(complete_style="green", finished_style="bold green"),
+                TaskProgressColumn(),
+                TextColumn("•"),
+                TimeElapsedColumn(),
+                TextColumn("•"),
+                TimeRemainingColumn(),
+                console=console,
+                transient=False
+            ) as progress:
+
+                # Create progress bars
+                schedule_task = progress.add_task(
+                    "[blue]Scheduling cells...",
+                    total=len(cell_tasks)
+                )
+
+                complete_task = progress.add_task(
+                    "[cyan]Processing cells...",
+                    total=len(cell_tasks)
+                )
+
+                # Statistics tracking
+                start_time = time.time()
+                total_scheduled = 0
+                batch_cycle = 0
+
+                while tasks_queue or pending_tasks:
+                    batch_cycle += 1
+
+                    # Schedule new tasks up to max_parallel limit
+                    while len(pending_tasks) < max_parallel and tasks_queue:
+                        cell_task = tasks_queue.pop(0)
+
+                        try:
+                            # Build variables dictionary
+                            variables = {col_variable_name: cell_task['col_name']}
+
+                            flow_invoke_request = self.flowhunt.FlowInvokeRequest(
+                                variables=variables,
+                                human_input=cell_task['flow_input']
+                            )
+
+                            response = api_instance.invoke_flow_singleton(
+                                flow_id=flow_id,
+                                workspace_id=workspace_id,
+                                flow_invoke_request=flow_invoke_request
+                            )
+
+                            pending_tasks[response.id] = cell_task
+                            total_scheduled += 1
+                            progress.advance(schedule_task, 1)
+
+                        except Exception as e:
+                            console.print(f"[red]✗[/red] Failed to schedule cell [{cell_task['row_idx']}, {cell_task['col_name']}]: {str(e)[:60]}...")
+                            output_df.loc[cell_task['row_idx'], cell_task['col_name']] = f"ERROR: {str(e)}"
+                            failed_count += 1
+                            total_scheduled += 1
+                            progress.advance(schedule_task, 1)
+                            progress.advance(complete_task, 1)
+
+                    # Update progress descriptions
+                    running = len(pending_tasks)
+                    queued = len(tasks_queue)
+
+                    progress.update(
+                        schedule_task,
+                        description=f"[blue]Scheduling[/blue] │ {total_scheduled}/{len(cell_tasks)} scheduled"
+                    )
+
+                    progress.update(
+                        complete_task,
+                        description=f"[cyan]Processing[/cyan] │ [green]{completed_count} ✓[/green] [red]{failed_count} ✗[/red] [yellow]{running} ⚡[/yellow]"
+                    )
+
+                    # Check for completed tasks
+                    if pending_tasks:
+                        # Show message when all tasks are scheduled
+                        if total_scheduled == len(cell_tasks) and batch_cycle == 1:
+                            console.print(f"[bold green]✅ All {len(cell_tasks)} cells scheduled! Checking for results every {check_interval}s...[/bold green]")
+
+                        time.sleep(check_interval)
+                        process_ids = list(pending_tasks.keys())
+                        completed_in_batch = 0
+
+                        # Log checking status
+                        if batch_cycle % 5 == 0:  # Log every 5 cycles
+                            console.print(f"[dim]🔍 Checking {len(process_ids)} pending cells... (cycle {batch_cycle})[/dim]")
+
+                        for process_id in process_ids:
+                            cell_task = pending_tasks[process_id]
+
+                            try:
+                                is_ready, content = self.get_flow_results(flow_id, process_id)
+
+                                if is_ready:
+                                    del pending_tasks[process_id]
+                                    completed_in_batch += 1
+
+                                    if content and content != "NOCONTENT":
+                                        # Store result in output dataframe
+                                        output_df.loc[cell_task['row_idx'], cell_task['col_name']] = content
+                                        completed_count += 1
+                                    else:
+                                        # No content returned
+                                        output_df.loc[cell_task['row_idx'], cell_task['col_name']] = "ERROR: No content returned"
+                                        failed_count += 1
+
+                            except Exception as e:
+                                console.print(f"[red]✗[/red] Processing error for [{cell_task['row_idx']}, {cell_task['col_name']}]: {str(e)[:60]}...")
+                                del pending_tasks[process_id]
+                                output_df.loc[cell_task['row_idx'], cell_task['col_name']] = f"ERROR: {str(e)}"
+                                failed_count += 1
+                                completed_in_batch += 1
+
+                        # Advance progress
+                        if completed_in_batch > 0:
+                            progress.advance(complete_task, completed_in_batch)
+
+                            # Show batch completion
+                            if failed_count == 0:
+                                console.print(f"[green]✓[/green] Cycle {batch_cycle}: {completed_in_batch} cells completed successfully")
+                            else:
+                                console.print(f"[yellow]⚠[/yellow] Cycle {batch_cycle}: {completed_in_batch} cells processed")
+
+            # Final summary
+            total_time = time.time() - start_time
+            success_rate = (completed_count / len(cell_tasks) * 100) if cell_tasks else 0
+            throughput = len(cell_tasks) / total_time if total_time > 0 else 0
+
+            # Create summary table
+            summary_table = Table(
+                title="[bold]📊 Execution Summary[/bold]",
+                show_header=True,
+                header_style="bold magenta",
+                box=box.ROUNDED,
+                border_style="cyan"
+            )
+            summary_table.add_column("Metric", style="cyan", justify="left")
+            summary_table.add_column("Count", style="white", justify="right")
+            summary_table.add_column("Percentage", style="green", justify="right")
+
+            summary_table.add_row("✅ Completed", str(completed_count), f"{success_rate:.1f}%")
+            summary_table.add_row("❌ Failed", str(failed_count), f"{(failed_count/len(cell_tasks)*100):.1f}%" if cell_tasks else "0%")
+            summary_table.add_row("📊 Total Cells", str(len(cell_tasks)), "100%")
+
+            console.print(summary_table)
+
+            # Performance metrics
+            perf_panel = Panel(
+                f"[bold cyan]⚡ Performance Metrics[/bold cyan]\n"
+                f"[green]⏱️ Total time:[/green] {total_time:.1f} seconds\n"
+                f"[green]🚀 Throughput:[/green] {throughput:.1f} cells/second\n"
+                f"[green]🔥 Peak parallel:[/green] {max_parallel} workers\n"
+                f"[green]🎯 Success rate:[/green] {success_rate:.1f}%",
+                box=box.ROUNDED,
+                border_style="green"
+            )
+            console.print(perf_panel)
+
+        return {
+            "completed": completed_count,
+            "failed": failed_count,
+            "total": len(cell_tasks)
+        }
+
     @classmethod
     def from_config_file(cls, config_path: Optional[Path] = None) -> 'FlowHuntClient':
         """Create client from configuration file.

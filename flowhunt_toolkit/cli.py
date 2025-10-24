@@ -723,6 +723,118 @@ def batch_run(ctx, input_file, flow_id, output_dir, output_file, format, overwri
 
 
 @main.command()
+@click.argument('csv_file', type=click.Path(exists=True))
+@click.argument('flow_id', type=str)
+@click.option('--output-file', type=click.Path(), help='Output CSV file for results (default: auto-generated)')
+@click.option('--col-variable-name', type=str, default='col_name', help='Variable name for column headers (default: col_name)')
+@click.option('--check-interval', type=int, default=2, help='Seconds between result checks (default: 2)')
+@click.option('--max-parallel', type=int, default=50, help='Maximum number of tasks to schedule in parallel (default: 50)')
+@click.pass_context
+def batch_run_matrix(ctx, csv_file, flow_id, output_file, col_variable_name, check_interval, max_parallel):
+    """Run a flow for each cell in a CSV matrix (first column = input source).
+
+    This command processes each row in a CSV where the FIRST COLUMN contains the
+    input value, and each subsequent column represents a different processing variant.
+    For each cell in columns 2+, the first column's value is sent as flow_input,
+    and the column name is passed as a flow variable.
+
+    The output CSV preserves the first column as-is and replaces other cells with
+    flow results. Rows with empty first column are skipped. Failed executions will
+    show error messages in their cells.
+
+    Example CSV input:
+        Input,Variant1,Variant2,Variant3
+        What is AI?,"","",""
+        Python features?,"","",""
+
+    For each row, the first column value is sent to all other columns:
+    - Row 1, Variant1: flow_input="What is AI?", variables={"col_name": "Variant1"}
+    - Row 1, Variant2: flow_input="What is AI?", variables={"col_name": "Variant2"}
+    - Row 1, Variant3: flow_input="What is AI?", variables={"col_name": "Variant3"}
+    - (Same pattern for Row 2 with "Python features?")
+
+    CSV must have at least 2 columns (first = input, rest = processing columns).
+    Total executions = (non-empty rows) × (columns - 1)
+
+    CSV_FILE: Path to CSV file (first column = input source, rest = processing columns)
+    FLOW_ID: The FlowHunt flow ID to execute for each cell
+    """
+    verbose = ctx.obj.get('verbose', False)
+    logger = Logger(verbose=verbose)
+
+    # Generate automatic output file if not specified
+    if not output_file:
+        current_date = datetime.now().strftime("%Y-%m-%d")
+        output_file = f"{current_date}-{flow_id}-matrix-output.csv"
+        logger.info(f"Auto-generating output file: {output_file}")
+
+    # Log command start with configuration
+    config_args = {
+        'csv_file': csv_file,
+        'flow_id': flow_id,
+        'output_file': output_file,
+        'col_variable_name': col_variable_name,
+        'check_interval': f"{check_interval}s",
+        'max_parallel': max_parallel
+    }
+    logger.command_start('batch-run-matrix', config_args)
+
+    start_time = time.time()
+
+    try:
+        # Initialize FlowHunt client
+        logger.progress_start("Initializing FlowHunt client...")
+        try:
+            client = FlowHuntClient.from_config_file()
+            logger.progress_done("FlowHunt client initialized")
+        except FileNotFoundError:
+            logger.error("No FlowHunt configuration found. Please run 'flowhunt auth' first.")
+            sys.exit(1)
+        except Exception as e:
+            logger.error(f"Failed to initialize FlowHunt client: {str(e)}")
+            sys.exit(1)
+
+        # Execute matrix batch processing
+        logger.info(f"🔢 Starting CSV matrix batch processing...")
+        logger.info(f"📊 Column variable name: '{col_variable_name}'")
+        logger.info(f"⚡ Max parallel: {max_parallel} workers")
+
+        try:
+            stats = client.batch_execute_matrix_from_csv(
+                csv_file=csv_file,
+                flow_id=flow_id,
+                output_file=output_file,
+                col_variable_name=col_variable_name,
+                check_interval=check_interval,
+                max_parallel=max_parallel
+            )
+
+            duration = time.time() - start_time
+            logger.progress_done("Matrix batch execution completed", duration)
+
+            # Display results
+            logger.stats_table("Execution Results", {
+                "Total cells processed": stats['total'],
+                "Completed successfully": stats['completed'],
+                "Failed": stats['failed'],
+                "Output file": output_file
+            })
+
+            logger.info(f"✅ Results saved to {output_file}")
+
+        except Exception as e:
+            logger.error(f"Matrix batch execution failed: {str(e)}")
+            sys.exit(1)
+
+    except KeyboardInterrupt:
+        logger.error("Matrix batch execution interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        sys.exit(1)
+
+
+@main.command()
 @click.pass_context
 def auth(ctx):
     """Authenticate with FlowHunt API.

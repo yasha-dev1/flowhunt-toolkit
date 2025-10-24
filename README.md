@@ -10,10 +10,11 @@
 
 - **🔍 Flow Evaluation**: LLM-as-a-Judge evaluation system with comprehensive statistics
 - **📊 Batch Processing**: Execute flows in batches with CSV input/output
+- **🔢 CSV Matrix Processing**: Process each cell in a CSV as a separate flow execution
 - **🔧 Flow Management**: List, inspect, and manage your FlowHunt flows
 - **📈 Rich Reports**: Generate detailed evaluation reports with statistics and visualizations
 - **🔐 Authentication**: Secure API authentication management
-- **⚡ Performance**: Optimized for large-scale flow operations
+- **⚡ Performance**: Optimized for large-scale flow operations with parallel execution
 - **🔄 Data Indexing**: Index external data sources (LiveAgent, PDFs, DOCX, URLs, sitemaps, folders) into FlowHunt
 
 ## 🚀 Quick Install
@@ -99,6 +100,7 @@ flowhunt batch-run your-flow-id input.csv --output-dir results/
 | `flowhunt flows list` | List all available flows |
 | `flowhunt flows inspect` | Inspect flow configuration |
 | `flowhunt batch-run` | Execute flows in batch mode |
+| `flowhunt batch-run-matrix` | Process CSV matrix cells as individual flow executions |
 | `flowhunt index` | Index external data sources into FlowHunt |
 
 ## 📖 Detailed Usage
@@ -138,11 +140,150 @@ flow_input,filename,flow_variable
 
 ### Batch Processing
 
+FlowHunt Toolkit provides two powerful batch processing modes for different use cases.
+
+#### Standard Batch Processing (`batch-run`)
+
+Process multiple inputs from a CSV file where each row is a separate flow execution:
+
 ```bash
 flowhunt batch-run FLOW_ID input.csv \
   --output-dir results/ \
-  --batch-size 5 \
-  --max-workers 3
+  --max-parallel 50 \
+  --check-interval 2
+```
+
+**CSV Format for batch-run:**
+```csv
+flow_input,filename,flow_variable
+"Process this text","output1.txt","{\"key\": \"value\"}"
+"Another input","output2.txt","{\"key\": \"value2\"}"
+```
+
+**Features:**
+- 🚀 **Parallel Execution**: Control parallelism with `--max-parallel` (default: 50)
+- 📁 **File Output**: Save results to individual files using `filename` column
+- 🔄 **Variables Support**: Pass JSON variables via `flow_variable` column
+- ⚡ **Fast Polling**: Configurable `--check-interval` (default: 2s)
+- 📊 **Progress Tracking**: Real-time progress bars with success/failure counts
+
+**Options:**
+- `--output-file`: Single output file for aggregated results
+- `--output-dir`: Directory for individual file outputs (requires `filename` column)
+- `--format`: Output format (csv or json)
+- `--max-parallel`: Maximum parallel executions (default: 50)
+- `--check-interval`: Seconds between result checks (default: 2)
+- `--sequential`: Force sequential execution instead of parallel
+- `--overwrite`: Overwrite existing output files
+
+#### CSV Matrix Processing (`batch-run-matrix`)
+
+Process each row where the **first column contains the input** and subsequent columns represent different processing variants - perfect for A/B testing, multi-variant evaluation, or systematic comparisons:
+
+```bash
+flowhunt batch-run-matrix input.csv FLOW_ID \
+  --output-file results.csv \
+  --col-variable-name "variant" \
+  --max-parallel 100
+```
+
+**CSV Input Example:**
+```csv
+Input,Approach1,Approach2,Approach3
+What is AI?,,,
+Python features?,,,
+Data Science?,,,
+```
+
+**How it works:**
+- **First column** = input source for that row
+- **Each subsequent column** = a processing variant that receives the first column's value
+- For row 1: "What is AI?" is sent to Approach1, Approach2, and Approach3 (3 executions)
+- For row 2: "Python features?" is sent to Approach1, Approach2, and Approach3 (3 executions)
+- Total: 6 executions (2 rows × 3 processing columns)
+- First column → preserved as-is in output
+- Column name → flow variable (e.g., `{"variant": "Approach1"}`)
+- Rows with empty first column are skipped entirely
+- Output CSV maintains the same structure as input
+
+**Output Example:**
+```csv
+Input,Approach1,Approach2,Approach3
+What is AI?,Artificial Intelligence refers to...,AI is the simulation of...,Artificial Intelligence means...
+Python features?,Python offers dynamic typing...,Python provides simplicity...,Python includes extensive libraries...
+Data Science?,Data Science is an interdisciplinary...,Data Science combines statistics...,Data Science involves extracting insights...
+```
+
+**Features:**
+- 🔢 **Row-Based Processing**: First column value sent to all other columns in that row
+- 🏷️ **Variant Context**: Column name passed as flow variable to distinguish variants
+- ⚡ **High Parallelism**: Process hundreds of cells simultaneously
+- 📊 **Structure Preservation**: First column preserved, other cells filled with results
+- 🎯 **Smart Handling**: Empty first column rows skipped, errors shown in cells
+- 💪 **Singleton Execution**: Uses `invoke_flow_singleton` for reliability
+
+**Requirements:**
+- CSV must have at least 2 columns (first = input, rest = processing columns)
+- Total executions = (non-empty rows) × (number of columns - 1)
+
+**Options:**
+- `--output-file`: Output CSV path (auto-generated if not specified)
+- `--col-variable-name`: Variable name for column headers (default: `col_name`)
+- `--max-parallel`: Maximum parallel executions (default: 50)
+- `--check-interval`: Seconds between result checks (default: 2)
+
+**Flow Variables Available:**
+For each execution, your flow receives:
+```python
+{
+  "col_name": "Approach1"  # or your custom variable name
+}
+# flow_input = value from first column of that row
+```
+
+**Use Cases:**
+- 🎯 **A/B Testing**: Test different prompts/approaches on same inputs (first column = input, other columns = different prompt variants)
+- 🌐 **Multi-Language Translation**: Translate inputs to multiple languages (first column = text, other columns = target languages)
+- 🔄 **Prompt Comparison**: Compare different prompt strategies (first column = task, other columns = different prompt templates)
+- 📊 **Model Comparison**: Test same input across different models (first column = query, other columns = different model configurations)
+- 🧪 **Systematic Evaluation**: Evaluate multiple approaches against same test cases
+
+**Error Handling:**
+Failed cells will contain error messages like:
+```
+ERROR: Flow execution failed - timeout occurred
+```
+
+This makes it easy to identify and retry failed cells.
+
+**Complete Example:**
+
+Input CSV (`questions.csv`):
+```csv
+Question,GPT4_Approach,Claude_Approach,Gemini_Approach
+Explain quantum computing,,,
+What is machine learning?,,,
+Define blockchain,,,
+```
+
+Command:
+```bash
+flowhunt batch-run-matrix questions.csv my-flow-id \
+  --col-variable-name "model_variant" \
+  --max-parallel 100
+```
+
+In your flow, you can use the `model_variant` variable to customize behavior:
+- When `model_variant = "GPT4_Approach"` → use GPT-4 specific prompt
+- When `model_variant = "Claude_Approach"` → use Claude specific prompt
+- When `model_variant = "Gemini_Approach"` → use Gemini specific prompt
+
+Output CSV:
+```csv
+Question,GPT4_Approach,Claude_Approach,Gemini_Approach
+Explain quantum computing,Quantum computing uses quantum bits...,Quantum computing leverages quantum mechanics...,Quantum computing exploits quantum phenomena...
+What is machine learning?,Machine learning is a subset of AI...,Machine learning enables computers to learn...,Machine learning allows systems to improve...
+Define blockchain,Blockchain is a distributed ledger...,Blockchain is a decentralized database...,Blockchain is an immutable record system...
 ```
 
 ## 🔄 Indexing
