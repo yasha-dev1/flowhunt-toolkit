@@ -32,19 +32,67 @@ This will:
 - ✅ Download and install FlowHunt Toolkit
 - ✅ Add `flowhunt` command to your PATH
 - ✅ Set up everything automatically
+- ✅ Handle PEP 668 externally-managed environments (macOS/modern Linux)
+
+**Installation Methods:**
+
+The installer automatically detects your system and chooses the best installation method:
+
+1. **pipx** (Preferred for macOS): Installs in an isolated environment
+   - On macOS: Automatically installs pipx via Homebrew if needed
+   - Clean, isolated installation without conflicting with system Python
+
+2. **Virtual Environment** (Fallback): Creates a dedicated venv if pipx unavailable
+   - Self-contained installation in `~/.flowhunt-toolkit/.venv`
+   - No system Python packages affected
+
+3. **User Install** (Legacy systems): Traditional `pip install --user`
+   - For older systems without PEP 668 restrictions
 
 ### Manual Installation
 
 If you prefer manual installation:
 
+**Option 1: Using pipx (Recommended for macOS)**
+```bash
+# Install pipx first
+brew install pipx  # macOS
+# or: python3 -m pip install --user pipx  # Linux
+
+# Install FlowHunt Toolkit
+pipx install git+https://github.com/yasha-dev1/flowhunt-toolkit.git
+```
+
+**Option 2: Using virtual environment**
 ```bash
 # Clone the repository
 git clone https://github.com/yasha-dev1/flowhunt-toolkit.git
 cd flowhunt-toolkit
 
-# Install with pip
+# Create and activate virtual environment
+python3 -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Install in the virtual environment
 pip install -e .
 ```
+
+**Option 3: Traditional pip (may fail on macOS/modern Linux)**
+```bash
+git clone https://github.com/yasha-dev1/flowhunt-toolkit.git
+cd flowhunt-toolkit
+pip install --user -e .
+```
+
+### Troubleshooting Installation
+
+**"externally-managed-environment" error on macOS:**
+
+This is due to PEP 668, which prevents system-wide pip installations. The automatic installer handles this, but if you're installing manually:
+
+1. Use pipx: `brew install pipx && pipx install git+https://...`
+2. Or use a virtual environment (see Option 2 above)
+3. Or use `--break-system-packages` flag (not recommended)
 
 ### Verify Installation
 

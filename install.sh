@@ -89,6 +89,49 @@ check_pip() {
     print_success "pip found"
 }
 
+# Function to check if environment is externally managed (PEP 668)
+is_externally_managed() {
+    $PYTHON_CMD -c "import sysconfig; print(sysconfig.get_path('stdlib'))" 2>/dev/null | grep -q ".*" && \
+    [ -f "$($PYTHON_CMD -c 'import sysconfig; print(sysconfig.get_path("stdlib"))')/EXTERNALLY-MANAGED" ] 2>/dev/null
+    return $?
+}
+
+# Function to check and install pipx
+check_pipx() {
+    if command_exists pipx; then
+        print_success "pipx found"
+        return 0
+    else
+        print_warning "pipx not found"
+        OS=$(detect_os)
+
+        if [ "$OS" = "macos" ]; then
+            if command_exists brew; then
+                print_status "Installing pipx via Homebrew..."
+                brew install pipx
+                pipx ensurepath
+                print_success "pipx installed"
+                return 0
+            else
+                print_warning "Homebrew not found. Cannot auto-install pipx."
+                return 1
+            fi
+        elif [ "$OS" = "linux" ]; then
+            print_status "Attempting to install pipx..."
+            if $PYTHON_CMD -m pip install --user pipx 2>/dev/null; then
+                $PYTHON_CMD -m pipx ensurepath
+                export PATH="$HOME/.local/bin:$PATH"
+                print_success "pipx installed"
+                return 0
+            else
+                print_warning "Could not install pipx automatically."
+                return 1
+            fi
+        fi
+        return 1
+    fi
+}
+
 # Function to install system dependencies
 install_system_deps() {
     OS=$(detect_os)
@@ -139,7 +182,7 @@ create_directories() {
 # Function to download and install
 install_flowhunt() {
     print_status "Downloading FlowHunt Toolkit..."
-    
+
     # Remove existing installation if it exists
     if [ -d "$INSTALL_DIR" ]; then
         print_status "Removing existing installation..."
@@ -151,33 +194,73 @@ install_flowhunt() {
     cd "$INSTALL_DIR"
 
     print_status "Installing FlowHunt Toolkit..."
-    
-    # Install using pip in user mode
-    $PIP_CMD install --user -e .
 
-    print_success "FlowHunt Toolkit installed successfully"
+    # Check if environment is externally managed (PEP 668)
+    if is_externally_managed; then
+        print_warning "Detected externally-managed Python environment (PEP 668)"
+
+        # Try to use pipx (recommended for CLI tools)
+        if check_pipx; then
+            print_status "Installing with pipx (isolated environment)..."
+            pipx install -e "$INSTALL_DIR" --force
+            INSTALL_METHOD="pipx"
+            print_success "FlowHunt Toolkit installed via pipx"
+        else
+            # Fallback: Create a dedicated virtual environment
+            print_status "Creating dedicated virtual environment..."
+            VENV_DIR="$INSTALL_DIR/.venv"
+            $PYTHON_CMD -m venv "$VENV_DIR"
+
+            print_status "Installing in virtual environment..."
+            "$VENV_DIR/bin/pip" install --upgrade pip
+            "$VENV_DIR/bin/pip" install -e "$INSTALL_DIR"
+            INSTALL_METHOD="venv"
+            print_success "FlowHunt Toolkit installed in virtual environment"
+        fi
+    else
+        # Traditional installation with --user flag
+        print_status "Installing with pip --user..."
+        $PIP_CMD install --user -e "$INSTALL_DIR"
+        INSTALL_METHOD="user"
+        print_success "FlowHunt Toolkit installed successfully"
+    fi
 }
 
 # Function to create wrapper script
 create_wrapper() {
     print_status "Creating wrapper script..."
-    
-    cat > "$BIN_DIR/flowhunt" << 'EOF'
+
+    # Only create wrapper if not using pipx (pipx creates its own)
+    if [ "$INSTALL_METHOD" = "pipx" ]; then
+        print_success "Using pipx-managed flowhunt command"
+        return 0
+    fi
+
+    cat > "$BIN_DIR/flowhunt" << EOF
 #!/bin/bash
 # FlowHunt Toolkit Wrapper Script
 
-# Find the Python executable
-if command -v python3 >/dev/null 2>&1; then
-    PYTHON_CMD="python3"
-elif command -v python >/dev/null 2>&1; then
-    PYTHON_CMD="python"
-else
-    echo "Error: Python not found" >&2
-    exit 1
-fi
+INSTALL_DIR="$INSTALL_DIR"
+VENV_DIR="\$INSTALL_DIR/.venv"
 
-# Execute the flowhunt CLI
-exec $PYTHON_CMD -m flowhunt_toolkit.cli "$@"
+# Check if virtual environment exists
+if [ -d "\$VENV_DIR" ]; then
+    # Use the venv Python
+    exec "\$VENV_DIR/bin/python" -m flowhunt_toolkit.cli "\$@"
+else
+    # Find the Python executable
+    if command -v python3 >/dev/null 2>&1; then
+        PYTHON_CMD="python3"
+    elif command -v python >/dev/null 2>&1; then
+        PYTHON_CMD="python"
+    else
+        echo "Error: Python not found" >&2
+        exit 1
+    fi
+
+    # Execute the flowhunt CLI
+    exec \$PYTHON_CMD -m flowhunt_toolkit.cli "\$@"
+fi
 EOF
 
     chmod +x "$BIN_DIR/flowhunt"
@@ -187,10 +270,18 @@ EOF
 # Function to update PATH
 update_path() {
     print_status "Updating PATH..."
-    
+
+    # If using pipx, it handles PATH automatically
+    if [ "$INSTALL_METHOD" = "pipx" ]; then
+        # Ensure pipx path is in current session
+        export PATH="$HOME/.local/bin:$PATH"
+        print_success "pipx manages PATH automatically"
+        return 0
+    fi
+
     # Detect shell
     SHELL_NAME=$(basename "$SHELL")
-    
+
     case $SHELL_NAME in
         "bash")
             SHELL_RC="$HOME/.bashrc"
@@ -225,8 +316,35 @@ update_path() {
 # Function to verify installation
 verify_installation() {
     print_status "Verifying installation..."
-    
-    if [ -x "$BIN_DIR/flowhunt" ]; then
+
+    # Test based on installation method
+    if [ "$INSTALL_METHOD" = "pipx" ]; then
+        if command -v flowhunt >/dev/null 2>&1; then
+            print_success "FlowHunt Toolkit installed successfully!"
+            echo
+            echo -e "${GREEN}Installation Complete!${NC}"
+            echo
+            echo "To get started:"
+            echo "  1. Run: flowhunt --help"
+            echo "  2. Authenticate: flowhunt auth"
+            echo
+            echo "Note: Installed via pipx in an isolated environment"
+            echo "For more information, visit: $REPO_URL"
+            echo
+
+            # Try to run the command
+            if flowhunt --version >/dev/null 2>&1; then
+                print_success "✓ flowhunt command is working"
+            else
+                print_warning "Installation completed but command test failed. You may need to restart your terminal."
+            fi
+        else
+            print_error "pipx installation completed but flowhunt command not found."
+            print_status "Try running: pipx ensurepath"
+            print_status "Then restart your terminal."
+            exit 1
+        fi
+    elif [ -x "$BIN_DIR/flowhunt" ]; then
         print_success "FlowHunt Toolkit installed successfully!"
         echo
         echo -e "${GREEN}Installation Complete!${NC}"
@@ -236,9 +354,12 @@ verify_installation() {
         echo "  2. Run: flowhunt --help"
         echo "  3. Authenticate: flowhunt auth"
         echo
+        if [ "$INSTALL_METHOD" = "venv" ]; then
+            echo "Note: Installed in a virtual environment at $INSTALL_DIR/.venv"
+        fi
         echo "For more information, visit: $REPO_URL"
         echo
-        
+
         # Try to run the command
         if "$BIN_DIR/flowhunt" --version >/dev/null 2>&1; then
             print_success "✓ flowhunt command is working"
@@ -274,9 +395,12 @@ main() {
     # Set up error handling
     trap cleanup EXIT
 
+    # Initialize installation method
+    INSTALL_METHOD=""
+
     # Check prerequisites
     print_status "Checking system requirements..."
-    
+
     # Check if running as root (not recommended)
     if [ "$EUID" -eq 0 ]; then
         print_warning "Running as root is not recommended. Installing for root user..."
