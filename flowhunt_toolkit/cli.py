@@ -988,8 +988,9 @@ def index(ctx):
 @click.argument('index_flow_id', type=str)
 @click.option('--max-tokens', type=int, default=8000, help='Maximum tokens per chunk (default: 8000)')
 @click.option('--output-csv', type=click.Path(), help='Path to save processing results CSV')
+@click.option('--sequential', is_flag=True, help='Process chunks sequentially, waiting for each to complete before starting the next')
 @click.pass_context
-def pdf(ctx, pdf_path, index_flow_id, max_tokens, output_csv):
+def pdf(ctx, pdf_path, index_flow_id, max_tokens, output_csv, sequential):
     """Index a PDF file by processing text chunks through a FlowHunt flow.
 
     This command extracts text from a PDF file, chunks it based on token count,
@@ -1015,7 +1016,8 @@ def pdf(ctx, pdf_path, index_flow_id, max_tokens, output_csv):
         'pdf_path': str(pdf_file),
         'index_flow_id': index_flow_id,
         'max_tokens': max_tokens,
-        'output_csv': str(output_path)
+        'output_csv': str(output_path),
+        'sequential': sequential
     }
     logger.command_start('index pdf', config_args)
 
@@ -1113,23 +1115,90 @@ def pdf(ctx, pdf_path, index_flow_id, max_tokens, output_csv):
                         singleton=False,
                     )
 
-                    # Add to results data
-                    results_data.append({
-                        'chunk_index': chunk_idx,
-                        'token_count': token_count,
-                        'chunk_preview': chunk_text[:100].replace('\n', ' '),
-                        'flow_process_id': process_id,
-                        'status': 'success',
-                        'indexed_at': datetime.now().isoformat()
-                    })
+                    # If sequential mode, poll until completion
+                    if sequential:
+                        if verbose:
+                            console.print(f"[blue]⏳[/blue] Waiting for chunk {chunk_idx}/{len(chunks)} to complete (process: {process_id})...")
 
-                    successful += 1
+                        poll_interval = 2  # seconds
+                        max_wait_time = 300  # 5 minutes timeout
+                        elapsed_time = 0
 
-                    if verbose:
-                        console.print(f"[green]✓[/green] Indexed chunk {chunk_idx}/{len(chunks)} ({token_count} tokens, process: {process_id})")
+                        while elapsed_time < max_wait_time:
+                            is_ready, result = flowhunt_client.get_flow_results(index_flow_id, process_id)
 
-                    # Rate limiting to be nice to the API
-                    time.sleep(0.5)
+                            if is_ready:
+                                if result and result != "NOCONTENT":
+                                    # Success
+                                    results_data.append({
+                                        'chunk_index': chunk_idx,
+                                        'token_count': token_count,
+                                        'chunk_preview': chunk_text[:100].replace('\n', ' '),
+                                        'flow_process_id': process_id,
+                                        'status': 'success',
+                                        'result': result[:200] + ('...' if len(result) > 200 else ''),
+                                        'indexed_at': datetime.now().isoformat()
+                                    })
+                                    successful += 1
+
+                                    if verbose:
+                                        console.print(f"[green]✓[/green] Chunk {chunk_idx}/{len(chunks)} completed successfully ({token_count} tokens)")
+                                else:
+                                    # Completed but no content
+                                    results_data.append({
+                                        'chunk_index': chunk_idx,
+                                        'token_count': token_count,
+                                        'chunk_preview': chunk_text[:100].replace('\n', ' '),
+                                        'flow_process_id': process_id,
+                                        'status': 'failed',
+                                        'error': 'No content returned',
+                                        'indexed_at': datetime.now().isoformat()
+                                    })
+                                    failed += 1
+
+                                    if verbose:
+                                        console.print(f"[red]✗[/red] Chunk {chunk_idx}/{len(chunks)} returned no content")
+
+                                break
+
+                            # Wait before next poll
+                            time.sleep(poll_interval)
+                            elapsed_time += poll_interval
+
+                        # Check if timed out
+                        if elapsed_time >= max_wait_time:
+                            results_data.append({
+                                'chunk_index': chunk_idx,
+                                'token_count': token_count,
+                                'chunk_preview': chunk_text[:100].replace('\n', ' '),
+                                'flow_process_id': process_id,
+                                'status': 'failed',
+                                'error': 'Timeout waiting for completion',
+                                'indexed_at': datetime.now().isoformat()
+                            })
+                            failed += 1
+
+                            if verbose:
+                                console.print(f"[red]✗[/red] Chunk {chunk_idx}/{len(chunks)} timed out")
+
+                    else:
+                        # Non-sequential mode - just add to results data immediately
+                        results_data.append({
+                            'chunk_index': chunk_idx,
+                            'token_count': token_count,
+                            'chunk_preview': chunk_text[:100].replace('\n', ' '),
+                            'flow_process_id': process_id,
+                            'status': 'success',
+                            'indexed_at': datetime.now().isoformat()
+                        })
+
+                        successful += 1
+
+                        if verbose:
+                            console.print(f"[green]✓[/green] Indexed chunk {chunk_idx}/{len(chunks)} ({token_count} tokens, process: {process_id})")
+
+                        # Rate limiting to be nice to the API
+                        time.sleep(0.5)
 
                 except Exception as e:
                     failed += 1
