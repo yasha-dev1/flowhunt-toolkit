@@ -835,35 +835,39 @@ def batch_run_matrix(ctx, csv_file, flow_id, output_file, col_variable_name, che
 
 
 @main.command()
+@click.option('--base-url', default='https://api.flowhunt.io', help='FlowHunt API base URL (protocol + domain)')
 @click.pass_context
-def auth(ctx):
+def auth(ctx, base_url):
     """Authenticate with FlowHunt API.
-    
+
     This command will prompt for API credentials and store them securely.
+    You can optionally specify a custom base URL for the API endpoint.
     """
     verbose = ctx.obj.get('verbose', False)
-    
+
     if verbose:
         click.echo("Setting up FlowHunt API authentication")
-    
+        click.echo(f"Using API endpoint: {base_url}")
+
     # Prompt for API key
     api_key = click.prompt("Enter your FlowHunt API key", hide_input=True, type=str)
 
     try:
         # Test the credentials by creating a client and making a simple API call
-        client = FlowHuntClient(api_key=api_key, base_url="https://api.flowhunt.io")
-        
+        client = FlowHuntClient(api_key=api_key, base_url=base_url)
+
         click.echo("Testing API connection...")
         # Try to list flows to verify the credentials work
         flows = client.list_flows()
-        
+
         # Save configuration
         client.save_config()
-        
+
         click.echo("✓ Authentication successful!")
         click.echo(f"✓ Configuration saved to {Path.home() / '.flowhunt' / 'config.json'}")
+        click.echo(f"✓ API endpoint: {base_url}")
         click.echo(f"✓ Found {len(flows)} flows in your account")
-        
+
     except Exception as e:
         click.echo(f"✗ Authentication failed: {str(e)}", err=True)
         sys.exit(1)
