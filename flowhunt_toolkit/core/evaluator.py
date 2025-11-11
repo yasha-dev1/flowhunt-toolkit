@@ -4,6 +4,12 @@ import pandas as pd
 from typing import Dict, Any, List, Optional
 from pathlib import Path
 import json
+import time
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
+from rich.panel import Panel
+from rich.table import Table
+from rich import box
 
 from .client import FlowHuntClient
 from .report_generator import EvaluationReportGenerator
@@ -107,6 +113,350 @@ class FlowEvaluator:
             batch_results.append(result)
         
         return batch_results
+
+    def evaluate_parallel(self, flow_id: str, evaluation_data: pd.DataFrame,
+                         max_parallel: int = 4, check_interval: int = 2) -> List[Dict[str, Any]]:
+        """Evaluate questions in parallel with controlled parallelism.
+
+        Args:
+            flow_id: FlowHunt flow ID to evaluate
+            evaluation_data: DataFrame with 'flow_input' and 'expected_output' columns
+            max_parallel: Maximum number of parallel evaluations
+            check_interval: Seconds between result checks
+
+        Returns:
+            List of all evaluation results
+        """
+        console = Console()
+        workspace_id = self.client.get_workspace_id()
+
+        # Prepare evaluation tasks
+        eval_tasks = []
+        for _, row in evaluation_data.iterrows():
+            eval_tasks.append({
+                'question': str(row['flow_input']),
+                'expected_answer': str(row['expected_output'])
+            })
+
+        with self.client.flowhunt.ApiClient(self.client.configuration) as api_client:
+            api_instance = self.client.flowhunt.FlowsApi(api_client)
+
+            # Track tasks
+            pending_flow_tasks = {}  # flow_id -> {process_id, question, expected_answer}
+            pending_judge_tasks = {}  # judge_flow_id -> {process_id, question, expected_answer, actual_answer}
+            completed_results = []
+            failed_results = []
+            tasks_queue = eval_tasks.copy()
+
+            # Create header
+            header_panel = Panel(
+                f"[bold cyan]🎯 PARALLEL FLOW EVALUATION[/bold cyan]\n"
+                f"[dim]Evaluating {len(eval_tasks)} questions with max {max_parallel} parallel workers[/dim]\n"
+                f"[dim]Flow ID: {flow_id[:8]}...{flow_id[-8:] if len(flow_id) > 16 else flow_id}[/dim]\n"
+                f"[dim]Judge Flow ID: {self.judge_flow_id[:8]}...{self.judge_flow_id[-8:] if len(self.judge_flow_id) > 16 else self.judge_flow_id}[/dim]",
+                box=box.ROUNDED,
+                border_style="cyan"
+            )
+            console.print(header_panel)
+
+            # Create progress display
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(complete_style="green", finished_style="bold green"),
+                TaskProgressColumn(),
+                TextColumn("•"),
+                TimeElapsedColumn(),
+                TextColumn("•"),
+                TimeRemainingColumn(),
+                console=console,
+                transient=False
+            ) as progress:
+
+                # Create three progress bars
+                schedule_task = progress.add_task(
+                    "[blue]Scheduling evaluations...",
+                    total=len(eval_tasks)
+                )
+
+                flow_task = progress.add_task(
+                    "[yellow]Running flows...",
+                    total=len(eval_tasks)
+                )
+
+                judge_task = progress.add_task(
+                    "[magenta]Judging results...",
+                    total=len(eval_tasks)
+                )
+
+                # Statistics tracking
+                start_time = time.time()
+                total_scheduled = 0
+                total_flow_completed = 0
+                total_judged = 0
+
+                while tasks_queue or pending_flow_tasks or pending_judge_tasks:
+                    # Schedule new flow evaluations up to max_parallel limit
+                    current_running = len(pending_flow_tasks) + len(pending_judge_tasks)
+                    while current_running < max_parallel and tasks_queue:
+                        task = tasks_queue.pop(0)
+
+                        try:
+                            # Execute target flow
+                            flow_inputs = {"input": task['question'], "question": task['question']}
+                            flow_invoke_request = self.client.flowhunt.FlowInvokeRequest(
+                                variables={},
+                                human_input=task['question']
+                            )
+
+                            response = api_instance.invoke_flow_singleton(
+                                flow_id=flow_id,
+                                workspace_id=workspace_id,
+                                flow_invoke_request=flow_invoke_request
+                            )
+
+                            pending_flow_tasks[response.id] = {
+                                'question': task['question'],
+                                'expected_answer': task['expected_answer']
+                            }
+                            total_scheduled += 1
+                            progress.advance(schedule_task, 1)
+                            current_running += 1
+
+                        except Exception as e:
+                            console.print(f"[red]✗[/red] Failed to schedule flow: {str(e)[:60]}...")
+                            failed_results.append({
+                                "question": task['question'],
+                                "expected_answer": task['expected_answer'],
+                                "actual_answer": f"ERROR: {str(e)}",
+                                "judge_score": 0,
+                                "judge_correctness": "Error",
+                                "judge_reasoning": f"Error scheduling flow: {str(e)}",
+                                "flow_id": flow_id,
+                                "judge_flow_id": self.judge_flow_id,
+                                "error": str(e)
+                            })
+                            total_scheduled += 1
+                            progress.advance(schedule_task, 1)
+                            progress.advance(flow_task, 1)
+                            progress.advance(judge_task, 1)
+
+                    # Update progress descriptions
+                    progress.update(
+                        schedule_task,
+                        description=f"[blue]Scheduling[/blue] │ {total_scheduled}/{len(eval_tasks)} scheduled"
+                    )
+
+                    progress.update(
+                        flow_task,
+                        description=f"[yellow]Running flows[/yellow] │ [green]{total_flow_completed} ✓[/green] [yellow]{len(pending_flow_tasks)} ⚡[/yellow]"
+                    )
+
+                    progress.update(
+                        judge_task,
+                        description=f"[magenta]Judging[/magenta] │ [green]{total_judged} ✓[/green] [red]{len(failed_results)} ✗[/red] [yellow]{len(pending_judge_tasks)} ⚡[/yellow]"
+                    )
+
+                    # Check for completed flow tasks
+                    if pending_flow_tasks or pending_judge_tasks:
+                        time.sleep(check_interval)
+
+                        # Check completed flows
+                        flow_process_ids = list(pending_flow_tasks.keys())
+                        for process_id in flow_process_ids:
+                            task_data = pending_flow_tasks[process_id]
+
+                            try:
+                                is_ready, content = self.client.get_flow_results(flow_id, process_id)
+
+                                if is_ready:
+                                    del pending_flow_tasks[process_id]
+                                    total_flow_completed += 1
+                                    progress.advance(flow_task, 1)
+
+                                    if content and content != "NOCONTENT":
+                                        # Schedule judge evaluation
+                                        try:
+                                            judge_inputs = {
+                                                "target_response": task_data['expected_answer'],
+                                                "actual_response": content
+                                            }
+                                            judge_invoke_request = self.client.flowhunt.FlowInvokeRequest(
+                                                variables=judge_inputs,
+                                                human_input=""
+                                            )
+
+                                            judge_response = api_instance.invoke_flow_singleton(
+                                                flow_id=self.judge_flow_id,
+                                                workspace_id=workspace_id,
+                                                flow_invoke_request=judge_invoke_request
+                                            )
+
+                                            pending_judge_tasks[judge_response.id] = {
+                                                'question': task_data['question'],
+                                                'expected_answer': task_data['expected_answer'],
+                                                'actual_answer': content
+                                            }
+
+                                        except Exception as e:
+                                            console.print(f"[red]✗[/red] Failed to schedule judge: {str(e)[:60]}...")
+                                            failed_results.append({
+                                                "question": task_data['question'],
+                                                "expected_answer": task_data['expected_answer'],
+                                                "actual_answer": content,
+                                                "judge_score": 0,
+                                                "judge_correctness": "Error",
+                                                "judge_reasoning": f"Error scheduling judge: {str(e)}",
+                                                "flow_id": flow_id,
+                                                "judge_flow_id": self.judge_flow_id,
+                                                "error": str(e)
+                                            })
+                                            progress.advance(judge_task, 1)
+                                    else:
+                                        failed_results.append({
+                                            "question": task_data['question'],
+                                            "expected_answer": task_data['expected_answer'],
+                                            "actual_answer": "ERROR: No content returned",
+                                            "judge_score": 0,
+                                            "judge_correctness": "Error",
+                                            "judge_reasoning": "No content returned from flow",
+                                            "flow_id": flow_id,
+                                            "judge_flow_id": self.judge_flow_id,
+                                            "error": "No content"
+                                        })
+                                        progress.advance(judge_task, 1)
+
+                            except Exception as e:
+                                console.print(f"[red]✗[/red] Flow processing error: {str(e)[:60]}...")
+                                del pending_flow_tasks[process_id]
+                                total_flow_completed += 1
+                                progress.advance(flow_task, 1)
+                                failed_results.append({
+                                    "question": task_data['question'],
+                                    "expected_answer": task_data['expected_answer'],
+                                    "actual_answer": f"ERROR: {str(e)}",
+                                    "judge_score": 0,
+                                    "judge_correctness": "Error",
+                                    "judge_reasoning": f"Error during flow execution: {str(e)}",
+                                    "flow_id": flow_id,
+                                    "judge_flow_id": self.judge_flow_id,
+                                    "error": str(e)
+                                })
+                                progress.advance(judge_task, 1)
+
+                        # Check completed judge tasks
+                        judge_process_ids = list(pending_judge_tasks.keys())
+                        for process_id in judge_process_ids:
+                            task_data = pending_judge_tasks[process_id]
+
+                            try:
+                                is_ready, content = self.client.get_flow_results(self.judge_flow_id, process_id)
+
+                                if is_ready:
+                                    del pending_judge_tasks[process_id]
+                                    total_judged += 1
+                                    progress.advance(judge_task, 1)
+
+                                    if content and content != "NOCONTENT":
+                                        try:
+                                            judge_result = json.loads(content)
+                                            judge_score = judge_result.pop('total_rating', 0)
+                                            judge_correctness = judge_result.pop('correctness', 'Unknown')
+                                            judge_reasoning = judge_result.pop('reasoning', 'No reasoning provided')
+
+                                            completed_results.append({
+                                                "question": task_data['question'],
+                                                "expected_answer": task_data['expected_answer'],
+                                                "actual_answer": task_data['actual_answer'],
+                                                "flow_id": flow_id,
+                                                "judge_flow_id": self.judge_flow_id,
+                                                "judge_score": judge_score,
+                                                "judge_correctness": judge_correctness,
+                                                "judge_reasoning": judge_reasoning,
+                                                **judge_result
+                                            })
+                                        except Exception as e:
+                                            console.print(f"[red]✗[/red] Failed to parse judge result: {str(e)[:60]}...")
+                                            failed_results.append({
+                                                "question": task_data['question'],
+                                                "expected_answer": task_data['expected_answer'],
+                                                "actual_answer": task_data['actual_answer'],
+                                                "judge_score": 0,
+                                                "judge_correctness": "Error",
+                                                "judge_reasoning": f"Error parsing judge result: {str(e)}",
+                                                "flow_id": flow_id,
+                                                "judge_flow_id": self.judge_flow_id,
+                                                "error": str(e)
+                                            })
+                                    else:
+                                        failed_results.append({
+                                            "question": task_data['question'],
+                                            "expected_answer": task_data['expected_answer'],
+                                            "actual_answer": task_data['actual_answer'],
+                                            "judge_score": 0,
+                                            "judge_correctness": "Error",
+                                            "judge_reasoning": "No content returned from judge",
+                                            "flow_id": flow_id,
+                                            "judge_flow_id": self.judge_flow_id,
+                                            "error": "No judge content"
+                                        })
+
+                            except Exception as e:
+                                console.print(f"[red]✗[/red] Judge processing error: {str(e)[:60]}...")
+                                del pending_judge_tasks[process_id]
+                                total_judged += 1
+                                progress.advance(judge_task, 1)
+                                failed_results.append({
+                                    "question": task_data['question'],
+                                    "expected_answer": task_data['expected_answer'],
+                                    "actual_answer": task_data['actual_answer'],
+                                    "judge_score": 0,
+                                    "judge_correctness": "Error",
+                                    "judge_reasoning": f"Error during judge evaluation: {str(e)}",
+                                    "flow_id": flow_id,
+                                    "judge_flow_id": self.judge_flow_id,
+                                    "error": str(e)
+                                })
+
+            # Combine all results
+            all_results = completed_results + failed_results
+
+            # Final summary
+            total_time = time.time() - start_time
+            success_rate = (len(completed_results) / len(eval_tasks) * 100) if eval_tasks else 0
+
+            # Create summary table
+            summary_table = Table(
+                title="[bold]📊 Evaluation Summary[/bold]",
+                show_header=True,
+                header_style="bold magenta",
+                box=box.ROUNDED,
+                border_style="cyan"
+            )
+            summary_table.add_column("Metric", style="cyan", justify="left")
+            summary_table.add_column("Count", style="white", justify="right")
+            summary_table.add_column("Percentage", style="green", justify="right")
+
+            summary_table.add_row("✅ Completed", str(len(completed_results)), f"{success_rate:.1f}%")
+            summary_table.add_row("❌ Failed", str(len(failed_results)), f"{(len(failed_results)/len(eval_tasks)*100):.1f}%" if eval_tasks else "0%")
+            summary_table.add_row("📊 Total", str(len(eval_tasks)), "100%")
+
+            console.print(summary_table)
+
+            # Performance metrics
+            throughput = len(eval_tasks) / total_time if total_time > 0 else 0
+            perf_panel = Panel(
+                f"[bold cyan]⚡ Performance Metrics[/bold cyan]\n"
+                f"[green]⏱️ Total time:[/green] {total_time:.1f} seconds\n"
+                f"[green]🚀 Throughput:[/green] {throughput:.2f} evaluations/second\n"
+                f"[green]🔥 Max parallel:[/green] {max_parallel} workers\n"
+                f"[green]🎯 Success rate:[/green] {success_rate:.1f}%",
+                box=box.ROUNDED,
+                border_style="green"
+            )
+            console.print(perf_panel)
+
+        return all_results
 
     def _judge_answer(self, expected_answer: str, actual_answer: str) -> Dict[str, Any]:
         """Use LLM judge to evaluate an answer.

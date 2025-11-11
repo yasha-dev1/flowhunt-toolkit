@@ -8,24 +8,32 @@ import html2text
 import tiktoken
 import xml.etree.ElementTree as ET
 from urllib.parse import urlparse, urljoin
+from .markdown_processor import MarkdownProcessor
 
 
 class WebProcessor:
-    """Handles web content extraction and token-based chunking."""
+    """Handles web content extraction and token-based chunking using markdown splitting."""
 
-    def __init__(self, max_tokens: int = 8000, encoding_name: str = "cl100k_base"):
+    def __init__(self, max_tokens: int = 4000, overlap_tokens: int = 100, encoding_name: str = "cl100k_base"):
         """Initialize web processor.
 
         Args:
-            max_tokens: Maximum tokens per chunk (default: 8000)
+            max_tokens: Maximum tokens per chunk (default: 4000)
+            overlap_tokens: Number of tokens to overlap between chunks (default: 100)
             encoding_name: Tiktoken encoding to use (default: cl100k_base for GPT-4/ChatGPT)
         """
         self.max_tokens = max_tokens
+        self.overlap_tokens = overlap_tokens
         self.encoding = tiktoken.get_encoding(encoding_name)
         self.html_converter = html2text.HTML2Text()
         self.html_converter.ignore_links = False
         self.html_converter.ignore_images = False
         self.html_converter.body_width = 0  # Don't wrap text
+        self.markdown_processor = MarkdownProcessor(
+            max_tokens=max_tokens,
+            overlap_tokens=overlap_tokens,
+            encoding_name=encoding_name
+        )
 
     def fetch_url(self, url: str, timeout: int = 30) -> str:
         """Fetch content from a URL.
@@ -119,12 +127,12 @@ class WebProcessor:
         return len(self.encoding.encode(text))
 
     def chunk_text(self, text: str, max_tokens: int = None, url: str = None) -> List[Tuple[str, int]]:
-        """Split text into chunks based on token count.
+        """Split markdown text into chunks based on headers and token count.
 
         Args:
-            text: Text to chunk
+            text: Markdown text to chunk (already converted from HTML)
             max_tokens: Maximum tokens per chunk (uses instance default if not specified)
-            url: Optional URL to prepend as H1 header to each chunk
+            url: Optional URL to use as source identifier
 
         Returns:
             List of (chunk_text, token_count) tuples
@@ -132,83 +140,12 @@ class WebProcessor:
         if max_tokens is None:
             max_tokens = self.max_tokens
 
-        # Calculate header token cost if URL is provided
-        header = ""
-        header_tokens = 0
-        if url:
-            header = f"# {url}\n\n"
-            header_tokens = self.count_tokens(header)
-            # Adjust max_tokens to account for header
-            max_tokens = max_tokens - header_tokens
-
-        # Split text into paragraphs
-        paragraphs = text.split('\n\n')
-        chunks = []
-        current_chunk = []
-        current_tokens = 0
-
-        for para in paragraphs:
-            para = para.strip()
-            if not para:
-                continue
-
-            para_tokens = self.count_tokens(para)
-
-            # If a single paragraph exceeds max_tokens, split it by sentences
-            if para_tokens > max_tokens:
-                # If we have accumulated content, save it first
-                if current_chunk:
-                    chunk_text = '\n\n'.join(current_chunk)
-                    if header:
-                        chunk_text = header + chunk_text
-                    chunks.append((chunk_text, current_tokens + header_tokens))
-                    current_chunk = []
-                    current_tokens = 0
-
-                # Split paragraph into sentences
-                sentences = para.replace('!', '.').replace('?', '.').split('.')
-                for sentence in sentences:
-                    sentence = sentence.strip()
-                    if not sentence:
-                        continue
-
-                    sent_tokens = self.count_tokens(sentence + '.')
-
-                    if current_tokens + sent_tokens > max_tokens and current_chunk:
-                        # Save current chunk
-                        chunk_text = '\n\n'.join(current_chunk)
-                        if header:
-                            chunk_text = header + chunk_text
-                        chunks.append((chunk_text, current_tokens + header_tokens))
-                        current_chunk = [sentence + '.']
-                        current_tokens = sent_tokens
-                    else:
-                        current_chunk.append(sentence + '.')
-                        current_tokens += sent_tokens
-
-            # Normal case: add paragraph to current chunk
-            elif current_tokens + para_tokens <= max_tokens:
-                current_chunk.append(para)
-                current_tokens += para_tokens
-            else:
-                # Save current chunk and start new one
-                if current_chunk:
-                    chunk_text = '\n\n'.join(current_chunk)
-                    if header:
-                        chunk_text = header + chunk_text
-                    chunks.append((chunk_text, current_tokens + header_tokens))
-
-                current_chunk = [para]
-                current_tokens = para_tokens
-
-        # Add final chunk if any
-        if current_chunk:
-            chunk_text = '\n\n'.join(current_chunk)
-            if header:
-                chunk_text = header + chunk_text
-            chunks.append((chunk_text, current_tokens + header_tokens))
-
-        return chunks
+        # Use MarkdownProcessor to chunk the text
+        return self.markdown_processor.chunk_markdown(
+            markdown_text=text,
+            max_tokens=max_tokens,
+            source_header=url
+        )
 
     def process_url(self, url: str, max_tokens: int = None) -> List[Tuple[str, int]]:
         """Fetch URL content and chunk it based on token count.

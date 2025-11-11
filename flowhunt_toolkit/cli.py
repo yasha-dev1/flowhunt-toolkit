@@ -44,8 +44,10 @@ def main(ctx, verbose):
 @click.option('--judge-flow-id', type=str, help='Custom LLM judge flow ID (uses default public flow if not specified)')
 @click.option('--output-dir', '-o', type=click.Path(), help='Output Directory for evaluation results (default: eval_output)')
 @click.option('--batch-size', type=int, default=10, help='Batch size for processing (default: 10)')
+@click.option('--max-parallel', type=int, default=4, help='Maximum number of parallel evaluations (default: 4)')
+@click.option('--check-interval', type=int, default=2, help='Seconds between result checks (default: 2)')
 @click.pass_context
-def evaluate(ctx, csv_file, flow_id, judge_flow_id, output_dir, batch_size):
+def evaluate(ctx, csv_file, flow_id, judge_flow_id, output_dir, batch_size, max_parallel, check_interval):
     """Evaluate a flow using LLM as a judge.
     
     This command takes a CSV file with 'flow_input' and 'expected_output' columns
@@ -68,6 +70,8 @@ def evaluate(ctx, csv_file, flow_id, judge_flow_id, output_dir, batch_size):
         click.echo(f"Evaluating flow {flow_id} with CSV: {csv_file}")
         click.echo(f"Judge flow ID: {judge_flow_id or 'default public flow'}")
         click.echo(f"Batch size: {batch_size}")
+        click.echo(f"Max parallel: {max_parallel}")
+        click.echo(f"Check interval: {check_interval}s")
         click.echo(f"Output Directory: {output_path.absolute()}")
     
     try:
@@ -92,15 +96,14 @@ def evaluate(ctx, csv_file, flow_id, judge_flow_id, output_dir, batch_size):
             click.echo(f"Error: Failed to load CSV file: {str(e)}", err=True)
             sys.exit(1)
         
-        # Run evaluation
-        click.echo("Starting evaluation...")
-        with click.progressbar(length=len(evaluation_data), label='Evaluating') as bar:
-            results = []
-            for i in range(0, len(evaluation_data), batch_size):
-                batch = evaluation_data.iloc[i:i+batch_size]
-                batch_results = evaluator.evaluate_batch(flow_id, batch)
-                results.extend(batch_results)
-                bar.update(len(batch))
+        # Run evaluation with parallel execution
+        click.echo(f"Starting evaluation with {max_parallel} parallel workers...")
+        results = evaluator.evaluate_parallel(
+            flow_id=flow_id,
+            evaluation_data=evaluation_data,
+            max_parallel=max_parallel,
+            check_interval=check_interval
+        )
         
         # Calculate summary statistics
         summary = evaluator.calculate_summary_stats(results)
@@ -986,7 +989,7 @@ def index(ctx):
 @index.command()
 @click.argument('pdf_path', type=click.Path(exists=True))
 @click.argument('index_flow_id', type=str)
-@click.option('--max-tokens', type=int, default=8000, help='Maximum tokens per chunk (default: 8000)')
+@click.option('--max-tokens', type=int, default=4000, help='Maximum tokens per chunk (default: 4000)')
 @click.option('--output-csv', type=click.Path(), help='Path to save processing results CSV')
 @click.option('--sequential', is_flag=True, help='Process chunks sequentially, waiting for each to complete before starting the next')
 @click.pass_context
@@ -1260,7 +1263,7 @@ def pdf(ctx, pdf_path, index_flow_id, max_tokens, output_csv, sequential):
 @index.command()
 @click.argument('docx_path', type=click.Path(exists=True))
 @click.argument('index_flow_id', type=str)
-@click.option('--max-tokens', type=int, default=8000, help='Maximum tokens per chunk (default: 8000)')
+@click.option('--max-tokens', type=int, default=4000, help='Maximum tokens per chunk (default: 4000)')
 @click.option('--output-csv', type=click.Path(), help='Path to save processing results CSV')
 @click.pass_context
 def docx(ctx, docx_path, index_flow_id, max_tokens, output_csv):
@@ -1465,7 +1468,7 @@ def docx(ctx, docx_path, index_flow_id, max_tokens, output_csv):
 @index.command()
 @click.argument('url', type=str)
 @click.argument('index_flow_id', type=str)
-@click.option('--max-tokens', type=int, default=8000, help='Maximum tokens per chunk (default: 8000)')
+@click.option('--max-tokens', type=int, default=4000, help='Maximum tokens per chunk (default: 4000)')
 @click.option('--output-csv', type=click.Path(), help='Path to save processing results CSV')
 @click.pass_context
 def url(ctx, url, index_flow_id, max_tokens, output_csv):
@@ -1672,7 +1675,7 @@ def url(ctx, url, index_flow_id, max_tokens, output_csv):
 @index.command()
 @click.argument('sitemap_url', type=str)
 @click.argument('index_flow_id', type=str)
-@click.option('--max-tokens', type=int, default=8000, help='Maximum tokens per chunk (default: 8000)')
+@click.option('--max-tokens', type=int, default=4000, help='Maximum tokens per chunk (default: 4000)')
 @click.option('--limit', type=int, help='Maximum number of URLs to process from sitemap')
 @click.option('--output-csv', type=click.Path(), help='Path to save processing results CSV')
 @click.pass_context
@@ -2133,10 +2136,11 @@ def liveagent(ctx, base_url, index_flow_id, department_id, api_key, limit, outpu
 @index.command()
 @click.argument('folder_path', type=str)
 @click.argument('index_flow_id', type=str)
-@click.option('--max-tokens', type=int, default=8000, help='Maximum tokens per chunk (default: 8000)')
+@click.option('--max-tokens', type=int, default=4000, help='Maximum tokens per chunk (default: 4000)')
 @click.option('--output-csv', type=str, help='Path to save processing results CSV')
+@click.option('--sequential', is_flag=True, help='Process chunks sequentially, waiting for each to complete before starting the next')
 @click.pass_context
-def folder(ctx, folder_path, index_flow_id, max_tokens, output_csv):
+def folder(ctx, folder_path, index_flow_id, max_tokens, output_csv, sequential):
     """Index all PDF and DOCX files in a folder through a FlowHunt flow.
 
     This command scans a folder for PDF and DOCX files, extracts text from each,
@@ -2170,7 +2174,8 @@ def folder(ctx, folder_path, index_flow_id, max_tokens, output_csv):
         'folder_path': str(folder),
         'index_flow_id': index_flow_id,
         'max_tokens': max_tokens,
-        'output_csv': str(output_path)
+        'output_csv': str(output_path),
+        'sequential': sequential
     }
     logger.command_start('index folder', config_args)
 
@@ -2282,26 +2287,100 @@ def folder(ctx, folder_path, index_flow_id, max_tokens, output_csv):
                                 singleton=False,
                             )
 
-                            # Add to results data
-                            results_data.append({
-                                'file_index': file_idx,
-                                'filename': file_path.name,
-                                'file_type': file_type,
-                                'chunk_index': chunk_idx,
-                                'token_count': token_count,
-                                'chunk_preview': chunk_text[:100].replace('\n', ' '),
-                                'flow_process_id': process_id,
-                                'status': 'success',
-                                'indexed_at': datetime.now().isoformat()
-                            })
+                            # If sequential mode, poll until completion
+                            if sequential:
+                                if verbose:
+                                    console.print(f"[blue]⏳[/blue] Waiting for {file_path.name} chunk {chunk_idx}/{len(chunks)} to complete (process: {process_id})...")
 
-                            total_chunks += 1
+                                poll_interval = 2  # seconds
+                                max_wait_time = 300  # 5 minutes timeout
+                                elapsed_time = 0
 
-                            if verbose:
-                                console.print(f"[green]✓[/green] Indexed {file_path.name} chunk {chunk_idx}/{len(chunks)} ({token_count} tokens)")
+                                while elapsed_time < max_wait_time:
+                                    is_ready, result = flowhunt_client.get_flow_results(index_flow_id, process_id)
 
-                            # Rate limiting
-                            time.sleep(0.5)
+                                    if is_ready:
+                                        if result and result != "NOCONTENT":
+                                            # Success
+                                            results_data.append({
+                                                'file_index': file_idx,
+                                                'filename': file_path.name,
+                                                'file_type': file_type,
+                                                'chunk_index': chunk_idx,
+                                                'token_count': token_count,
+                                                'chunk_preview': chunk_text[:100].replace('\n', ' '),
+                                                'flow_process_id': process_id,
+                                                'status': 'success',
+                                                'result': result[:200] + ('...' if len(result) > 200 else ''),
+                                                'indexed_at': datetime.now().isoformat()
+                                            })
+                                            total_chunks += 1
+
+                                            if verbose:
+                                                console.print(f"[green]✓[/green] {file_path.name} chunk {chunk_idx}/{len(chunks)} completed successfully ({token_count} tokens)")
+                                        else:
+                                            # Completed but no content
+                                            results_data.append({
+                                                'file_index': file_idx,
+                                                'filename': file_path.name,
+                                                'file_type': file_type,
+                                                'chunk_index': chunk_idx,
+                                                'token_count': token_count,
+                                                'chunk_preview': chunk_text[:100].replace('\n', ' '),
+                                                'flow_process_id': process_id,
+                                                'status': 'failed',
+                                                'error': 'No content returned',
+                                                'indexed_at': datetime.now().isoformat()
+                                            })
+
+                                            if verbose:
+                                                console.print(f"[red]✗[/red] {file_path.name} chunk {chunk_idx}/{len(chunks)} returned no content")
+
+                                        break
+
+                                    # Wait before next poll
+                                    time.sleep(poll_interval)
+                                    elapsed_time += poll_interval
+
+                                # Check if timed out
+                                if elapsed_time >= max_wait_time:
+                                    results_data.append({
+                                        'file_index': file_idx,
+                                        'filename': file_path.name,
+                                        'file_type': file_type,
+                                        'chunk_index': chunk_idx,
+                                        'token_count': token_count,
+                                        'chunk_preview': chunk_text[:100].replace('\n', ' '),
+                                        'flow_process_id': process_id,
+                                        'status': 'failed',
+                                        'error': 'Timeout waiting for completion',
+                                        'indexed_at': datetime.now().isoformat()
+                                    })
+
+                                    if verbose:
+                                        console.print(f"[red]✗[/red] {file_path.name} chunk {chunk_idx}/{len(chunks)} timed out")
+
+                            else:
+                                # Non-sequential mode - just add to results data immediately
+                                results_data.append({
+                                    'file_index': file_idx,
+                                    'filename': file_path.name,
+                                    'file_type': file_type,
+                                    'chunk_index': chunk_idx,
+                                    'token_count': token_count,
+                                    'chunk_preview': chunk_text[:100].replace('\n', ' '),
+                                    'flow_process_id': process_id,
+                                    'status': 'success',
+                                    'indexed_at': datetime.now().isoformat()
+                                })
+
+                                total_chunks += 1
+
+                                if verbose:
+                                    console.print(f"[green]✓[/green] Indexed {file_path.name} chunk {chunk_idx}/{len(chunks)} ({token_count} tokens)")
+
+                                # Rate limiting
+                                time.sleep(0.5)
 
                         except Exception as e:
                             if verbose:
