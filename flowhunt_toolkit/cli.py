@@ -452,7 +452,7 @@ def batch_run(ctx, input_file, flow_id, output_dir, output_file, format, overwri
                             current_date = datetime.now().strftime("%Y-%m-%d")
                             output_file = f"{current_date}-{flow_id}-output.{format}"
                             logger.info(f"Saving aggregated results to: {output_file}")
-                        
+
                         # Save aggregated results
                         logger.progress_start(f"Saving results to {output_file}...")
                         try:
@@ -476,7 +476,110 @@ def batch_run(ctx, input_file, flow_id, output_dir, output_file, format, overwri
                     # User explicitly requested sequential processing
                     logger.info("📝 Using sequential processing (--sequential flag specified)")
                     logger.warning("Sequential processing is slower. Remove --sequential flag for parallel execution.")
-                    
+
+                    # Read topics from CSV for sequential processing
+                    topics = []
+                    with open(input_path, 'r', encoding='utf-8') as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            flow_input = row.get('flow_input', '').strip()
+                            if flow_input:
+                                topic = {'flow_input': flow_input}
+                                if 'filename' in row and row['filename']:
+                                    topic['filename'] = row['filename'].strip()
+                                if 'flow_variable' in row and row['flow_variable']:
+                                    import json
+                                    try:
+                                        topic['flow_variable'] = json.loads(row['flow_variable'].strip())
+                                    except json.JSONDecodeError:
+                                        pass
+                                topics.append(topic)
+
+                    logger.progress_start("Starting sequential batch execution...")
+
+                    from rich.console import Console
+                    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
+
+                    console = Console()
+                    completed = 0
+                    failed = 0
+                    skipped = 0
+
+                    with Progress(
+                        SpinnerColumn(),
+                        TextColumn("[progress.description]{task.description}"),
+                        BarColumn(complete_style="yellow", finished_style="bold yellow"),
+                        TaskProgressColumn(),
+                        TextColumn("•"),
+                        TimeRemainingColumn(),
+                        console=console,
+                        transient=False
+                    ) as progress:
+
+                        task = progress.add_task(
+                            "[yellow]Sequential processing...",
+                            total=len(topics)
+                        )
+
+                        for topic in topics:
+                            try:
+                                # Check if file already exists (skip if not overwriting)
+                                if has_filename and output_dir and not overwrite and 'filename' in topic:
+                                    file_path = Path(output_dir) / topic['filename']
+                                    if file_path.exists():
+                                        skipped += 1
+                                        progress.advance(task, 1)
+                                        continue
+
+                                # Build variables dictionary
+                                variables = {}
+                                if 'filename' in topic:
+                                    variables['filename'] = topic['filename']
+                                if 'flow_variable' in topic and isinstance(topic['flow_variable'], dict):
+                                    variables.update(topic['flow_variable'])
+
+                                # Execute flow
+                                result = client.execute_flow(flow_id, variables=variables, human_input=topic['flow_input'])
+
+                                if result:
+                                    # Save to file if filename column exists and output_dir is specified
+                                    if has_filename and output_dir and 'filename' in topic:
+                                        output_dir_path = Path(output_dir)
+                                        output_dir_path.mkdir(parents=True, exist_ok=True)
+                                        file_path = output_dir_path / topic['filename']
+                                        file_path.parent.mkdir(parents=True, exist_ok=True)
+                                        with open(file_path, 'w', encoding='utf-8') as f:
+                                            f.write(result)
+                                    completed += 1
+                                else:
+                                    failed += 1
+
+                                # Update progress
+                                progress.update(
+                                    task,
+                                    description=f"[yellow]Sequential[/yellow] │ [green]{completed} ✓[/green] [red]{failed} ✗[/red] [dim]{skipped} skipped[/dim]"
+                                )
+
+                            except Exception as e:
+                                failed += 1
+                                if verbose:
+                                    console.print(f"[red]✗[/red] Failed: {str(e)[:60]}...")
+
+                            progress.advance(task, 1)
+
+                    duration = time.time() - start_time
+                    logger.progress_done("Sequential execution completed", duration)
+
+                    # Display summary
+                    logger.stats_table("Execution Results", {
+                        "Total inputs": len(topics),
+                        "Completed successfully": completed,
+                        "Failed": failed,
+                        "Skipped (files already exist)": skipped
+                    })
+
+                    return
+
             except Exception as e:
                 if "CSV file must have headers" in str(e) or "CSV file must contain" in str(e) or "CSV file contains invalid" in str(e) or "--output-dir is required" in str(e):
                     # Re-raise validation errors
@@ -2281,6 +2384,7 @@ def folder(ctx, folder_path, index_flow_id, max_tokens, output_csv, sequential):
                                     'total_chunks': len(chunks),
                                     'token_count': token_count,
                                     'filename': file_path.name,
+                                    'file_path': str(file_path),
                                     'file_type': file_type.lower(),
                                     'source': 'folder'
                                 },
