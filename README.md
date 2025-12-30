@@ -150,6 +150,7 @@ flowhunt batch-run your-flow-id input.csv --output-dir results/
 | `flowhunt batch-run` | Execute flows in batch mode |
 | `flowhunt batch-run-matrix` | Process CSV matrix cells as individual flow executions |
 | `flowhunt index` | Index external data sources into FlowHunt |
+| `flowhunt update` | Check for updates and update to the latest version |
 
 ## 📖 Detailed Usage
 

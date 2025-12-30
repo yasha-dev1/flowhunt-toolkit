@@ -504,6 +504,7 @@ def batch_run(ctx, input_file, flow_id, output_dir, output_file, format, overwri
                     completed = 0
                     failed = 0
                     skipped = 0
+                    results = []  # Collect results for --output-file
 
                     with Progress(
                         SpinnerColumn(),
@@ -551,8 +552,25 @@ def batch_run(ctx, input_file, flow_id, output_dir, output_file, format, overwri
                                         with open(file_path, 'w', encoding='utf-8') as f:
                                             f.write(result)
                                     completed += 1
+                                    # Collect result for --output-file
+                                    results.append({
+                                        'input_index': len(results),
+                                        'flow_input': topic['flow_input'],
+                                        'variables': variables,
+                                        'result': result,
+                                        'status': 'success'
+                                    })
                                 else:
                                     failed += 1
+                                    # Collect failed result for --output-file
+                                    results.append({
+                                        'input_index': len(results),
+                                        'flow_input': topic['flow_input'],
+                                        'variables': variables,
+                                        'result': None,
+                                        'status': 'failed',
+                                        'error': 'No result returned'
+                                    })
 
                                 # Update progress
                                 progress.update(
@@ -562,6 +580,15 @@ def batch_run(ctx, input_file, flow_id, output_dir, output_file, format, overwri
 
                             except Exception as e:
                                 failed += 1
+                                # Collect failed result for --output-file
+                                results.append({
+                                    'input_index': len(results),
+                                    'flow_input': topic['flow_input'],
+                                    'variables': variables,
+                                    'result': None,
+                                    'status': 'failed',
+                                    'error': str(e)
+                                })
                                 if verbose:
                                     console.print(f"[red]✗[/red] Failed: {str(e)[:60]}...")
 
@@ -577,6 +604,45 @@ def batch_run(ctx, input_file, flow_id, output_dir, output_file, format, overwri
                         "Failed": failed,
                         "Skipped (files already exist)": skipped
                     })
+
+                    # Save results to output file if specified
+                    if output_file and results:
+                        logger.progress_start(f"Saving results to {output_file}...")
+                        try:
+                            output_path = Path(output_file)
+
+                            if format == 'csv' or output_path.suffix.lower() == '.csv':
+                                import pandas as pd
+                                # Flatten results for CSV
+                                flattened = []
+                                for r in results:
+                                    row = {
+                                        'input_index': r['input_index'],
+                                        'flow_input': r['flow_input'],
+                                        'status': r['status']
+                                    }
+                                    # Add variables as separate columns
+                                    if r.get('variables'):
+                                        for key, value in r['variables'].items():
+                                            row[f'var_{key}'] = str(value)
+
+                                    if r['status'] == 'success':
+                                        row['result'] = str(r['result'])
+                                    else:
+                                        row['error'] = r.get('error', '')
+                                    flattened.append(row)
+
+                                df = pd.DataFrame(flattened)
+                                df.to_csv(output_path, index=False)
+                            else:
+                                # JSON format
+                                import json
+                                with open(output_path, 'w') as f:
+                                    json.dump(results, f, indent=2)
+
+                            logger.progress_done(f"Results saved to {output_file}")
+                        except Exception as e:
+                            logger.warning(f"Failed to save results: {str(e)}")
 
                     return
 
@@ -2557,6 +2623,134 @@ def folder(ctx, folder_path, index_flow_id, max_tokens, output_csv, sequential):
             df = pd.DataFrame(results_data)
             df.to_csv(output_path, index=False)
             logger.info(f"Partial results saved to {output_path}")
+        sys.exit(1)
+
+
+@main.command()
+@click.option('--check', '-c', is_flag=True, help='Only check for updates without installing')
+@click.option('--force', '-f', is_flag=True, help='Force update even if already on latest version')
+@click.pass_context
+def update(ctx, check, force):
+    """Check for updates and update FlowHunt Toolkit to the latest version.
+
+    This command checks the GitHub repository for the latest version and
+    updates the CLI by re-running the installation script.
+
+    Examples:
+        flowhunt update           # Check and update if available
+        flowhunt update --check   # Only check for updates
+        flowhunt update --force   # Force reinstall latest version
+    """
+    import urllib.request
+    import re
+    import subprocess
+    import shutil
+
+    verbose = ctx.obj.get('verbose', False)
+    console = Console()
+
+    REPO_URL = "https://github.com/yasha-dev1/flowhunt-toolkit"
+    RAW_VERSION_URL = "https://raw.githubusercontent.com/yasha-dev1/flowhunt-toolkit/main/flowhunt_toolkit/__init__.py"
+    INSTALL_SCRIPT_URL = "https://raw.githubusercontent.com/yasha-dev1/flowhunt-toolkit/main/install.sh"
+
+    current_version = __version__
+
+    console.print(f"[blue]Current version:[/blue] {current_version}")
+
+    if verbose:
+        console.print(f"[dim]Checking for updates from: {RAW_VERSION_URL}[/dim]")
+
+    # Fetch latest version from GitHub
+    console.print("[blue]Checking for updates...[/blue]")
+    try:
+        with urllib.request.urlopen(RAW_VERSION_URL, timeout=10) as response:
+            content = response.read().decode('utf-8')
+
+        # Parse version from __init__.py
+        version_match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', content)
+        if not version_match:
+            console.print("[red]Error: Could not parse version from repository[/red]")
+            sys.exit(1)
+
+        latest_version = version_match.group(1)
+
+    except urllib.error.URLError as e:
+        console.print(f"[red]Error: Failed to check for updates: {e}[/red]")
+        console.print("[yellow]Please check your internet connection and try again.[/yellow]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    console.print(f"[blue]Latest version:[/blue]  {latest_version}")
+
+    # Compare versions
+    def parse_version(v):
+        """Parse version string into tuple for comparison."""
+        return tuple(int(x) for x in re.findall(r'\d+', v))
+
+    current_tuple = parse_version(current_version)
+    latest_tuple = parse_version(latest_version)
+
+    if current_tuple >= latest_tuple and not force:
+        console.print("\n[green]✓ You are already running the latest version![/green]")
+        return
+
+    if current_tuple < latest_tuple:
+        console.print(f"\n[yellow]⚡ Update available: {current_version} → {latest_version}[/yellow]")
+    elif force:
+        console.print("\n[yellow]Force reinstalling latest version...[/yellow]")
+
+    if check:
+        console.print("\n[dim]Run 'flowhunt update' to install the update.[/dim]")
+        return
+
+    # Confirm update
+    if not force:
+        if not click.confirm("\nDo you want to update now?", default=True):
+            console.print("[dim]Update cancelled.[/dim]")
+            return
+
+    # Perform update by re-running the install script
+    console.print("\n[blue]Downloading and running install script...[/blue]")
+
+    try:
+        # Check if curl is available
+        if not shutil.which('curl'):
+            console.print("[red]Error: 'curl' is required but not found.[/red]")
+            console.print("[yellow]Please install curl and try again.[/yellow]")
+            sys.exit(1)
+
+        # Check if bash is available
+        if not shutil.which('bash'):
+            console.print("[red]Error: 'bash' is required but not found.[/red]")
+            sys.exit(1)
+
+        # Run the install script
+        install_cmd = f'curl -sSL {INSTALL_SCRIPT_URL} | bash'
+
+        if verbose:
+            console.print(f"[dim]Running: {install_cmd}[/dim]")
+
+        result = subprocess.run(
+            install_cmd,
+            shell=True,
+            capture_output=False,
+            text=True
+        )
+
+        if result.returncode == 0:
+            console.print("\n[green]✓ Update completed successfully![/green]")
+            console.print("[dim]Please restart your terminal or run 'source ~/.bashrc' (or ~/.zshrc) to use the updated version.[/dim]")
+        else:
+            console.print(f"\n[red]✗ Update failed with exit code {result.returncode}[/red]")
+            sys.exit(1)
+
+    except subprocess.SubprocessError as e:
+        console.print(f"[red]Error running install script: {e}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
         sys.exit(1)
 
 
