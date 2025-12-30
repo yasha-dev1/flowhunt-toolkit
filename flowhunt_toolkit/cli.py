@@ -445,8 +445,8 @@ def batch_run(ctx, input_file, flow_id, output_dir, output_file, format, overwri
                         "Skipped (files already exist)": stats['skipped']
                     })
                     
-                    # If force_parallel without filename, results are in stats['results']
-                    if force_parallel and not has_filename and 'results' in stats:
+                    # Save results to output file if specified and results available
+                    if not has_filename and 'results' in stats:
                         # Generate automatic output file if not specified
                         if not output_file:
                             current_date = datetime.now().strftime("%Y-%m-%d")

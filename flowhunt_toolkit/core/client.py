@@ -346,8 +346,8 @@ class FlowHuntClient:
             failed_tasks = []
             topics_queue = topics.copy()
             
-            # Store results when force_parallel without output_dir
-            all_results = [] if (force_parallel and not output_dir) else None
+            # Store results when there's no output_dir (results need to be returned)
+            all_results = [] if not output_dir else None
             
             # Create a beautiful header
             header_panel = Panel(
