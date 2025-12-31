@@ -857,23 +857,27 @@ def batch_run(ctx, input_file, flow_id, output_dir, output_file, format, overwri
                     import pandas as pd
                     # Flatten results for CSV
                     flattened = []
-                    for r in results:
+                    for idx, r in enumerate(results):
                         row = {
-                            'input_index': r['input_index'],
-                            'flow_input': r['flow_input'],
-                            'status': r['status']
+                            'input_index': r.get('input_index', idx),
+                            'flow_input': r.get('flow_input', ''),
+                            'status': r.get('status', 'unknown')
                         }
-                        # Add variables as separate columns
-                        if r['variables']:
-                            for key, value in r['variables'].items():
+                        # Add variables as separate columns (support both 'variables' dict and 'flow_variable')
+                        variables = r.get('variables') or {}
+                        if variables:
+                            for key, value in variables.items():
                                 row[f'var_{key}'] = str(value)
-                        
-                        if r['status'] == 'success':
-                            row['result'] = str(r['result'])
+                        # Also handle flow_variable from client results
+                        if r.get('flow_variable'):
+                            row['flow_variable'] = str(r['flow_variable'])
+
+                        if r.get('status') == 'success':
+                            row['result'] = str(r.get('result', ''))
                         else:
                             row['error'] = r.get('error', '')
                         flattened.append(row)
-                    
+
                     df = pd.DataFrame(flattened)
                     df.to_csv(output_path, index=False)
                 else:
@@ -884,7 +888,15 @@ def batch_run(ctx, input_file, flow_id, output_dir, output_file, format, overwri
                 
                 logger.progress_done(f"Results saved to {output_file}")
             except Exception as e:
-                logger.warning(f"Failed to save results: {str(e)}")
+                logger.warning(f"Failed to save flattened results: {str(e)}")
+                # Fallback: save raw results directly
+                try:
+                    import pandas as pd
+                    df = pd.DataFrame(results)
+                    df.to_csv(output_path, index=False)
+                    logger.progress_done(f"Results saved (raw format) to {output_file}")
+                except Exception as e2:
+                    logger.error(f"Failed to save results entirely: {str(e2)}")
 
     except KeyboardInterrupt:
         logger.error("Batch execution interrupted by user")

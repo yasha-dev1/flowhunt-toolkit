@@ -271,12 +271,13 @@ class FlowHuntClient:
                 if 'flow_input' not in reader.fieldnames:
                     raise ValueError("CSV file must contain 'flow_input' column")
                 
-                for row in reader:
+                for idx, row in enumerate(reader):
                     flow_input = row['flow_input'].strip()
-                    
+
                     if flow_input:
                         topic = {
-                            'flow_input': flow_input
+                            'flow_input': flow_input,
+                            'input_index': idx
                         }
                         
                         # Add filename if present
@@ -487,6 +488,7 @@ class FlowHuntClient:
                                         # Store result if force_parallel without output_dir
                                         if all_results is not None:
                                             result_entry = {
+                                                'input_index': topic_data.get('input_index'),
                                                 'flow_input': topic_data['flow_input'],
                                                 'result': content,
                                                 'status': 'success'
@@ -504,6 +506,7 @@ class FlowHuntClient:
                                         # Store failed result if force_parallel without output_dir
                                         if all_results is not None:
                                             result_entry = {
+                                                'input_index': topic_data.get('input_index'),
                                                 'flow_input': topic_data['flow_input'],
                                                 'result': None,
                                                 'status': 'failed',
@@ -523,6 +526,7 @@ class FlowHuntClient:
                                 # Store error result if force_parallel without output_dir
                                 if all_results is not None:
                                     result_entry = {
+                                        'input_index': topic_data.get('input_index'),
                                         'flow_input': topic_data['flow_input'],
                                         'result': None,
                                         'status': 'error',
