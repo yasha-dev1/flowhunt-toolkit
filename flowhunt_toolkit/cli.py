@@ -2638,6 +2638,123 @@ def folder(ctx, folder_path, index_flow_id, max_tokens, output_csv, sequential):
         sys.exit(1)
 
 
+@main.group()
+@click.pass_context
+def deepagent(ctx):
+    """Deep Agent commands for flow session-based invocations.
+
+    Create flow sessions, upload attachments, and invoke flows
+    with a conversational message interface.
+    """
+    pass
+
+
+@deepagent.command()
+@click.argument('flow_id', type=str)
+@click.option('--input-value', '-i', required=True, type=str, help='The message/input to send to the flow')
+@click.option('--attachment', '-a', multiple=True, type=click.Path(exists=True), help='File path(s) to upload as attachments (can be specified multiple times)')
+@click.option('--output-dir', '-o', type=click.Path(), help='Directory to save artefact files produced by the flow')
+@click.option('--timeout', type=int, default=300, help='Maximum time to wait for response in seconds (default: 300)')
+@click.pass_context
+def invoke(ctx, flow_id, input_value, attachment, output_dir, timeout):
+    """Invoke a flow via a session with an input message.
+
+    Creates a flow session, optionally uploads attachments, sends the
+    input message, and polls for the AI response. If --output-dir is
+    specified, any artefact files produced by the flow are downloaded
+    and saved to that directory.
+
+    FLOW_ID: The FlowHunt flow ID to invoke
+
+    Examples:
+        flowhunt deepagent invoke <flow_id> -i "Hello"
+        flowhunt deepagent invoke <flow_id> -i "Analyze this" -a file.pdf
+        flowhunt deepagent invoke <flow_id> -i "Compare these" -a doc1.pdf -a doc2.pdf
+        flowhunt deepagent invoke <flow_id> -i "Generate report" -o ./output
+    """
+    verbose = ctx.obj.get('verbose', False)
+    logger = Logger(verbose=verbose)
+    console = Console()
+
+    try:
+        # Initialize client
+        try:
+            client = FlowHuntClient.from_config_file()
+        except FileNotFoundError:
+            click.echo("Error: No FlowHunt configuration found. Please run 'flowhunt auth' first.", err=True)
+            sys.exit(1)
+        except Exception as e:
+            click.echo(f"Error: Failed to initialize FlowHunt client: {str(e)}", err=True)
+            sys.exit(1)
+
+        # Create flow session
+        logger.info("Creating flow session...")
+        session_id = client.create_flow_session(flow_id)
+        logger.info(f"Session created: {session_id}")
+
+        # Upload attachments if provided
+        if attachment:
+            for file_path in attachment:
+                logger.info(f"Uploading attachment: {file_path}")
+                result = client.upload_attachment(session_id, file_path)
+                logger.info(f"Uploaded: {result.get('file_name', file_path)}")
+
+        # Invoke flow session
+        logger.info("Invoking flow session and waiting for response...")
+        response = client.invoke_flow_session(
+            session_id=session_id,
+            message=input_value,
+            timeout=timeout
+        )
+
+        # Print the AI response message
+        ai_message = response.get('message', '')
+        if ai_message:
+            console.print(ai_message)
+
+        # Handle artefacts
+        artefacts = response.get('artefacts', [])
+        if artefacts:
+            logger.info(f"Flow produced {len(artefacts)} artefact(s)")
+
+            if output_dir:
+                import requests
+
+                out_path = Path(output_dir)
+                out_path.mkdir(parents=True, exist_ok=True)
+
+                for art in artefacts:
+                    logger.info(f"Downloading artefact: {art['name']} ({art['size']} bytes)")
+
+                    file_dest = out_path / art['path']
+                    file_dest.parent.mkdir(parents=True, exist_ok=True)
+
+                    download_url = art.get('download_url')
+                    if download_url:
+                        resp = requests.get(download_url, timeout=60)
+                        resp.raise_for_status()
+                        with open(file_dest, 'wb') as f:
+                            f.write(resp.content)
+                    else:
+                        content_resp = client.get_artefact_content(session_id, art['id'])
+                        with open(file_dest, 'w', encoding='utf-8') as f:
+                            f.write(content_resp.get('content', ''))
+
+                    logger.info(f"Saved: {file_dest}")
+
+                logger.info(f"All artefacts saved to {out_path}")
+            else:
+                for art in artefacts:
+                    logger.info(f"  Artefact: {art['name']} ({art['size']} bytes) - use --output-dir to save")
+
+    except TimeoutError as e:
+        click.echo(f"Error: {str(e)}", err=True)
+        sys.exit(1)
+    except Exception as e:
+        click.echo(f"Error: {str(e)}", err=True)
+        sys.exit(1)
+
+
 @main.command()
 @click.option('--check', '-c', is_flag=True, help='Only check for updates without installing')
 @click.option('--force', '-f', is_flag=True, help='Force update even if already on latest version')

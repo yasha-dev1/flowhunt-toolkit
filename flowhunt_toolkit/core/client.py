@@ -18,16 +18,17 @@ from rich import box
 class FlowHuntClient:
     """Wrapper for FlowHunt API client using official FlowHunt SDK."""
     
-    def __init__(self, api_key: Optional[str] = None, base_url: str = "https://api.flowhunt.io"):
+    def __init__(self, api_key: Optional[str] = None, base_url: str = "https://api.flowhunt.io", workspace_id: Optional[str] = None):
         """Initialize FlowHunt client.
-        
+
         Args:
             api_key: FlowHunt API key. If not provided, will look for FLOWHUNT_API_KEY env var.
             base_url: FlowHunt API base URL.
+            workspace_id: Workspace ID. If not provided, will look for FLOWHUNT_WORKSPACE_ID env var or fetch from API.
         """
         self.api_key = api_key or os.getenv('FLOWHUNT_API_KEY')
         self.base_url = base_url
-        self._workspace_id = None
+        self._workspace_id = workspace_id or os.getenv('FLOWHUNT_WORKSPACE_ID')
         
         if not self.api_key:
             raise ValueError("FlowHunt API key is required. Set FLOWHUNT_API_KEY environment variable or pass api_key parameter.")
@@ -48,20 +49,24 @@ class FlowHuntClient:
             raise Exception(f"Failed to initialize FlowHunt SDK: {e}")
     
     def get_workspace_id(self) -> str:
-        """Get the workspace ID from FlowHunt API.
-        
+        """Get the workspace ID.
+
         Returns:
             Workspace ID
         """
         if self._workspace_id:
             return self._workspace_id
-            
+
         with self.flowhunt.ApiClient(self.configuration) as api_client:
-            api_instance = self.flowhunt.WebAuthApi(api_client)
+            api_instance = self.flowhunt.WorkspacesApi(api_client)
             try:
-                api_response = api_instance.get_user()
-                self._workspace_id = api_response.api_key_workspace_id
-                return self._workspace_id
+                workspaces = api_instance.search_my_workspaces(
+                    self.flowhunt.WorkspaceSearchRequest()
+                )
+                if workspaces:
+                    self._workspace_id = workspaces[0].workspace_id
+                    return self._workspace_id
+                raise Exception("No workspaces found for this API key")
             except self.flowhunt.ApiException as e:
                 raise Exception(f"Failed to get workspace ID: {e}")
     
@@ -883,6 +888,163 @@ class FlowHuntClient:
             "total": len(cell_tasks)
         }
 
+    def create_flow_session(self, flow_id: str) -> str:
+        """Create a new flow session.
+
+        Args:
+            flow_id: The FlowHunt flow ID
+
+        Returns:
+            Session ID
+        """
+        workspace_id = self.get_workspace_id()
+
+        with self.flowhunt.ApiClient(self.configuration) as api_client:
+            api_instance = self.flowhunt.FlowsApi(api_client)
+
+            try:
+                request = self.flowhunt.FlowSessionCreateFromFlowRequest(flow_id=flow_id)
+                response = api_instance.create_flow_session(
+                    workspace_id=workspace_id,
+                    flow_session_create_from_flow_request=request
+                )
+                return response.session_id
+            except self.flowhunt.ApiException as e:
+                raise Exception(f"Failed to create flow session for flow {flow_id}: {e}")
+
+    def upload_attachment(self, session_id: str, file_path: str) -> dict:
+        """Upload a file attachment to a flow session.
+
+        Args:
+            session_id: The flow session ID
+            file_path: Path to the file to upload
+
+        Returns:
+            Attachment response as dict
+        """
+        with self.flowhunt.ApiClient(self.configuration) as api_client:
+            api_instance = self.flowhunt.FlowsApi(api_client)
+
+            try:
+                with open(file_path, 'rb') as f:
+                    file_bytes = f.read()
+                file_name = Path(file_path).name
+                response = api_instance.upload_attachments(
+                    session_id=session_id,
+                    file=(file_name, file_bytes)
+                )
+                return response.to_dict()
+            except self.flowhunt.ApiException as e:
+                raise Exception(f"Failed to upload attachment {file_path}: {e}")
+
+    def invoke_flow_session(self, session_id: str, message: str, timeout: int = 300, check_interval: int = 2) -> dict:
+        """Invoke a flow session with a message and poll for results.
+
+        Args:
+            session_id: The flow session ID
+            message: The message to send
+            timeout: Maximum time to wait for completion in seconds
+            check_interval: Seconds between poll requests
+
+        Returns:
+            Dict with 'message' (AI response text) and 'artefacts' (list of artefact info dicts)
+        """
+        with self.flowhunt.ApiClient(self.configuration) as api_client:
+            api_instance = self.flowhunt.FlowsApi(api_client)
+
+            try:
+                request = self.flowhunt.FlowSessionInvokeRequest(message=message)
+                invoke_response = api_instance.invoke_flow_response(
+                    session_id=session_id,
+                    flow_session_invoke_request=request
+                )
+                from_timestamp = invoke_response.created_at
+            except self.flowhunt.ApiException as e:
+                raise Exception(f"Failed to invoke flow session {session_id}: {e}")
+
+            # Poll for results
+            start_time = time.time()
+            all_seen_event_ids = set()
+            collected_artefacts = []
+
+            while time.time() - start_time < timeout:
+                time.sleep(check_interval)
+                try:
+                    events = api_instance.poll_flow_response(
+                        session_id=session_id,
+                        from_timestamp=from_timestamp
+                    )
+                    for event in events:
+                        eid = getattr(event, 'event_id', None)
+                        if eid and eid in all_seen_event_ids:
+                            continue
+                        if eid:
+                            all_seen_event_ids.add(eid)
+
+                        action = getattr(event, 'action_type', None)
+                        etype = getattr(event, 'event_type', None)
+
+                        # Collect artefacts
+                        if action == self.flowhunt.FlowEventActionType.ARTEFACTS:
+                            meta = getattr(event, 'metadata', None)
+                            if meta:
+                                actual = getattr(meta, 'actual_instance', None)
+                                if actual and hasattr(actual, 'artefacts'):
+                                    for art in actual.artefacts:
+                                        collected_artefacts.append({
+                                            'id': art.id,
+                                            'name': art.name,
+                                            'path': art.path,
+                                            'size': art.size,
+                                            'download_url': art.download_url,
+                                        })
+
+                        # Check for final AI message
+                        if (action == self.flowhunt.FlowEventActionType.MESSAGE
+                                and etype == self.flowhunt.MessageType.AI):
+                            ai_message = ''
+                            meta = getattr(event, 'metadata', None)
+                            if meta:
+                                actual = getattr(meta, 'actual_instance', None)
+                                if actual and hasattr(actual, 'message'):
+                                    ai_message = actual.message
+                            return {
+                                'message': ai_message,
+                                'artefacts': collected_artefacts,
+                            }
+                except self.flowhunt.ApiException:
+                    pass  # Continue polling on transient errors
+
+            raise TimeoutError(f"Flow session invocation timed out after {timeout} seconds")
+
+    def get_artefact_content(self, session_id: str, artefact_id: str) -> dict:
+        """Get the content of an artefact from a flow session.
+
+        Args:
+            session_id: The flow session ID
+            artefact_id: The artefact ID
+
+        Returns:
+            Dict with 'name', 'path', 'content', 'size'
+        """
+        with self.flowhunt.ApiClient(self.configuration) as api_client:
+            api_instance = self.flowhunt.FlowsApi(api_client)
+
+            try:
+                response = api_instance.get_artefact_content(
+                    session_id=session_id,
+                    artefact_id=artefact_id
+                )
+                return {
+                    'id': response.id,
+                    'name': response.name,
+                    'path': response.path,
+                    'size': response.size,
+                    'content': response.content,
+                }
+            except self.flowhunt.ApiException as e:
+                raise Exception(f"Failed to get artefact content {artefact_id}: {e}")
+
     @classmethod
     def from_config_file(cls, config_path: Optional[Path] = None) -> 'FlowHuntClient':
         """Create client from configuration file.
@@ -914,11 +1076,12 @@ class FlowHuntClient:
             
             api_key = config.get('api_key')
             base_url = config.get('base_url', 'https://api.flowhunt.io')
-            
+            workspace_id = config.get('workspace_id')
+
             if not api_key:
                 raise ValueError("No API key found in configuration file")
-            
-            return cls(api_key=api_key, base_url=base_url)
+
+            return cls(api_key=api_key, base_url=base_url, workspace_id=workspace_id)
             
         except (json.JSONDecodeError, KeyError) as e:
             raise ValueError(f"Invalid configuration file format: {str(e)}")
