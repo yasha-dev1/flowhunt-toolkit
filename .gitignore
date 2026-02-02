@@ -136,3 +136,4 @@ batch_outputs/
 
 # Idea project files
 .idea/
+/memory/

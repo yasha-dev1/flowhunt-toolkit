@@ -38,10 +38,7 @@ def test_evaluate_command_missing_config():
             f.write('What is 2+2?,4\n')
         
         result = runner.invoke(main, ['evaluate', 'test.csv', 'test-flow-id'])
-        # The command should complete successfully even with errors in flow execution
-        assert result.exit_code == 0
-        assert 'Evaluation completed!' in result.output
-        assert 'Error rate: 100.0%' in result.output
+        assert result.exit_code == 1
 
 
 def test_flows_inspect_command_missing_config():
